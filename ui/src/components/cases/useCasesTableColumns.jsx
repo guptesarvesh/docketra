@@ -1,0 +1,168 @@
+import { useMemo } from 'react';
+import { StatusBadge } from '../layout/StatusBadge';
+import { PriorityPill } from '../common/PriorityPill';
+import { SlaBadge } from '../common/SlaBadge';
+import { AuditMetadata } from '../ui/AuditMetadata';
+import { formatDateTime } from '../../utils/formatDateTime';
+import { formatCaseName } from '../../utils/formatters';
+import { ROUTES } from '../../constants/routes';
+
+const getEmployeeLabel = (row) => {
+  const snapshotXid = String(row?.employeeSnapshot?.xID || '').trim();
+  const snapshotName = String(row?.employeeSnapshot?.name || '').trim();
+  if (snapshotXid) return snapshotName ? `${snapshotXid} - ${snapshotName}` : snapshotXid;
+  const fallbackXid = String(row?.employeeXID || '').trim();
+  return fallbackXid || '';
+};
+
+export const useCasesTableColumns = ({
+  enableBulkActions,
+  allVisibleSelected,
+  handleSelectAll,
+  sortedCases,
+  selectedCaseIds,
+  handleToggleSelectCase,
+  getSlaBadgeStatus,
+  getRecencyLabel,
+  inactivityThresholdHours,
+  isAdmin,
+  assigningCaseId,
+  navigate,
+  firmSlug,
+  handleAssignToMe,
+  location,
+  setTimelineCaseId,
+  showQueueActions = true,
+}) => useMemo(() => [
+  ...(enableBulkActions ? [{
+    key: '__select',
+    header: (
+      <input
+        type="checkbox"
+        aria-label="Select all"
+        checked={allVisibleSelected}
+        onChange={() => handleSelectAll(sortedCases)}
+      />
+    ),
+    render: (row) => {
+      const isLocked = Boolean(row.lockStatus?.isLocked);
+      return (
+        <input
+          type="checkbox"
+          aria-label={`Select ${formatCaseName(row.caseName)}`}
+          checked={selectedCaseIds.has(row.caseId)}
+          disabled={isLocked}
+          onChange={() => handleToggleSelectCase(row.caseId, isLocked)}
+          onClick={(e) => e.stopPropagation()}
+        />
+      );
+    },
+    align: 'center',
+    headerClassName: 'w-[1px] whitespace-nowrap',
+    cellClassName: 'w-[1px] whitespace-nowrap',
+  }] : []),
+  {
+    key: 'caseName',
+    header: 'Docket Name',
+    sortable: true,
+    headerClassName: 'w-full max-w-lg',
+    cellClassName: 'w-full max-w-lg',
+    render: (row) => {
+      const slaStatus = getSlaBadgeStatus(row);
+      const breached = slaStatus === 'RED';
+      const warning = slaStatus === 'YELLOW';
+      const recency = getRecencyLabel(row.updatedAt);
+      return (
+        <div className={`cases-page__name-cell${breached ? ' cases-page__name-cell--sla-breach' : ''}${warning ? ' cases-page__name-cell--sla-warning' : ''}`}>
+          <span className="cases-page__case-title">{formatCaseName(row.caseName)}</span>
+          <AuditMetadata
+            className="cases-page__case-meta"
+            actor={row.updatedByName || row.updatedByXID || row.assignedToName || 'System'}
+            timestamp={row.updatedAt}
+          />
+          {getEmployeeLabel(row) ? <span className="cases-page__case-meta">Employee: {getEmployeeLabel(row)}</span> : null}
+          {recency && (<span className="cases-page__recency" aria-label={recency}>{recency}</span>)}
+          <div className="cases-page__pill-row">
+            <PriorityPill caseRecord={row} inactivityThresholdHours={inactivityThresholdHours} />
+            <SlaBadge status={slaStatus} className="cases-page__sla-badge" />
+          </div>
+        </div>
+      );
+    },
+  },
+  { key: 'category', header: 'Category', sortable: true, headerClassName: 'w-[1px] whitespace-nowrap', cellClassName: 'w-[1px] whitespace-nowrap' },
+  {
+    key: 'workType', header: 'Work Type', sortable: true, headerClassName: 'w-[1px] whitespace-nowrap', cellClassName: 'w-[1px] whitespace-nowrap',
+    render: (row) => (<StatusBadge status={row.isInternal ? 'INTERNAL' : 'CLIENT'} />),
+  },
+  { key: 'status', header: 'Status', sortable: true, align: 'center', headerClassName: 'w-[1px] whitespace-nowrap', cellClassName: 'w-[1px] whitespace-nowrap', render: (row) => <StatusBadge status={row.status} /> },
+  {
+    key: 'assignedToName', header: 'Assigned To', sortable: true, headerClassName: 'w-[1px] whitespace-nowrap', cellClassName: 'w-[1px] whitespace-nowrap',
+    render: (row) => row.assignedToName || row.assignedToXID || row.assignedTo || 'Unassigned',
+  },
+  {
+    key: 'updatedAt', header: 'Last Updated', align: 'right', tabular: true, sortable: true, headerClassName: 'w-[1px] whitespace-nowrap', cellClassName: 'w-[1px] whitespace-nowrap',
+    render: (row) => formatDateTime(row.updatedAt),
+  },
+  {
+    key: 'rowActions', header: '', align: 'right', headerClassName: 'w-[1px] whitespace-nowrap', cellClassName: 'w-[1px] whitespace-nowrap',
+    render: (row) => {
+      const isLocked = Boolean(row.lockStatus?.isLocked);
+      return (
+        <details className="cases-page__row-menu" onClick={(event) => event.stopPropagation()}>
+          <summary aria-label={`Row actions for ${formatCaseName(row.caseName)}`}>⋯</summary>
+          <div className="cases-page__row-menu-panel">
+            {(row.assignedToName || row.assignedToXID || row.assignedTo) && (
+              <div className="cases-page__row-menu-info">Assigned: {row.assignedToName || row.assignedToXID || row.assignedTo}</div>
+            )}
+            {isLocked && (<div className="cases-page__row-menu-info cases-page__row-menu-info--locked">🔒 Docket Locked</div>)}
+            <button
+              type="button"
+              onClick={(event) => {
+                event.stopPropagation();
+                const index = sortedCases.findIndex((c) => c.caseId === row.caseId);
+                const returnTo = `${location.pathname}${location.search || ''}`;
+                navigate(`${ROUTES.CASE_DETAIL(firmSlug, row.caseId)}?returnTo=${encodeURIComponent(returnTo)}`, {
+                  state: { sourceList: sortedCases.map((c) => c.caseId), index, returnTo },
+                });
+              }}
+            >
+              <span aria-hidden="true">View Docket</span>
+              <span className="sr-only">View Docket {formatCaseName(row.caseName)}</span>
+            </button>
+            {showQueueActions && !isAdmin && !isLocked && (
+              <button type="button" disabled={assigningCaseId === row.caseId} onClick={(event) => handleAssignToMe(row, event)}>
+                <span aria-hidden="true">{assigningCaseId === row.caseId ? 'Assigning…' : 'Assign to me'}</span>
+                <span className="sr-only">
+                  {assigningCaseId === row.caseId ? `Assigning ${formatCaseName(row.caseName)}…` : `Assign ${formatCaseName(row.caseName)} to me`}
+                </span>
+              </button>
+            )}
+            <button type="button" onClick={(event) => { event.stopPropagation(); setTimelineCaseId(row.caseId); }}>
+              <span aria-hidden="true">View Timeline</span>
+              <span className="sr-only">View Timeline for {formatCaseName(row.caseName)}</span>
+            </button>
+          </div>
+        </details>
+      );
+    },
+  },
+], [
+  enableBulkActions,
+  allVisibleSelected,
+  handleSelectAll,
+  sortedCases,
+  selectedCaseIds,
+  handleToggleSelectCase,
+  getSlaBadgeStatus,
+  getRecencyLabel,
+  inactivityThresholdHours,
+  isAdmin,
+  assigningCaseId,
+  navigate,
+  firmSlug,
+  handleAssignToMe,
+  location,
+  setTimelineCaseId,
+  showQueueActions,
+]);

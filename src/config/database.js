@@ -1,0 +1,59 @@
+const mongoose = require('mongoose');
+const config = require('./config');
+const log = require('../utils/log');
+
+/**
+ * Database connection configuration
+ * Handles MongoDB connection with proper error handling and retry logic
+ */
+
+let connectPromise = null;
+
+const connectDB = async () => {
+  if (mongoose.connection.readyState === 1) {
+    return mongoose.connection;
+  }
+
+  if (connectPromise) {
+    return connectPromise;
+  }
+
+  connectPromise = (async () => {
+  try {
+    // VALIDATION: Strict schema enforcement
+    mongoose.set('strict', true);
+    mongoose.set('strictQuery', true);
+    if (process.env.MONGOOSE_DEBUG === 'true') {
+      mongoose.set('debug', true);
+    }
+
+    const conn = await mongoose.connect(config.mongodbUri, {
+      autoIndex: process.env.NODE_ENV !== 'production',
+    });
+
+    log.info('MONGODB_CONNECTED', { host: conn.connection.host });
+
+    mongoose.connection.on('connected', () => {
+      log.info('MONGOOSE_CONNECTED');
+    });
+
+    mongoose.connection.on('error', (err) => {
+      log.error('MONGOOSE_CONNECTION_ERROR', { error: err.message });
+    });
+
+    mongoose.connection.on('disconnected', () => {
+      log.warn('MONGOOSE_DISCONNECTED');
+    });
+    return conn.connection;
+  } catch (error) {
+    log.error('MONGODB_CONNECT_FAILED', { error: error.message });
+    process.exit(1);
+  } finally {
+    connectPromise = null;
+  }
+  })();
+
+  return connectPromise;
+};
+
+module.exports = connectDB;

@@ -1,0 +1,418 @@
+const mongoose = require('mongoose');
+const softDeletePlugin = require('../utils/softDelete.plugin');
+const { tenantScopeGuardPlugin } = require('./plugins/tenantScopeGuard.plugin');
+
+/**
+ * Attachment Model for Docketra Case Management System
+ * 
+ * IMMUTABLE - NO UPDATES OR DELETES ALLOWED
+ * 
+ * This model stores file attachments for cases with mandatory descriptions.
+ * Attachments are stored locally using multer.
+ * 
+ * Attachments are allowed on: Open, Pending, Closed statuses
+ * Attachments are NOT allowed on: Filed status
+ * Attachments are NOT editable or deletable once created
+ */
+
+const attachmentSchema = new mongoose.Schema({
+  /**
+   * Reference to the case this attachment belongs to
+   * Stored as string to match Case.caseId (e.g., "DCK-0001")
+   * OPTIONAL for client CFS files (null for pure client CFS documents)
+   */
+  caseId: {
+    type: String,
+    index: true,
+  },
+  
+  // Firm/Organization ID for multi-tenancy
+  firmId: {
+    type: String,
+    required: [true, 'Firm ID is required'],
+    index: true,
+  },
+  
+  /**
+   * Reference to the client this attachment belongs to
+   * Stored as string to match Client.clientId (e.g., "C000001")
+   * REQUIRED for client CFS files
+   * OPTIONAL for case-specific attachments
+   */
+  clientId: {
+    type: String,
+    index: true,
+  },
+  
+  /**
+   * Original file name
+   */
+  fileName: {
+    type: String,
+    required: [true, 'File name is required'],
+  },
+
+  fileUrl: {
+    type: String,
+    trim: true,
+  },
+  uploadedBy: {
+    type: String,
+    uppercase: true,
+    trim: true,
+  },
+
+  uploadedByName: {
+    type: String,
+    trim: true,
+  },
+
+  uploadedAtReadable: {
+    type: String,
+    trim: true,
+  },
+
+  version: {
+    type: Number,
+    default: 1,
+    min: 1,
+  },
+
+  webViewLink: {
+    type: String,
+    trim: true,
+  },
+  
+  /**
+   * Local storage path for the file
+   * ⚠️ DEPRECATED - FOR BACKWARD COMPATIBILITY ONLY ⚠️
+   * 
+   * Legacy field for local file storage.
+   * New attachments use storageFileId instead.
+   * This field is kept for backward compatibility with existing attachments.
+   */
+  filePath: {
+    type: String,
+    trim: true,
+  },
+  
+  /**
+   * Google Drive file ID
+   * ⚠️ LEGACY GOOGLE FILE REFERENCE ⚠️
+   * 
+   * All new attachments are stored in Google Drive.
+   * This field stores the Google Drive file ID for the attachment.
+   * 
+   * Optional for backward compatibility with legacy attachments.
+   * New writes must persist storageFileId + storageProvider.
+   */
+  driveFileId: {
+    type: String,
+    trim: true,
+  },
+
+  storageProvider: {
+    type: String,
+    enum: ['google-drive'],
+    required: function requiredStorageProvider() {
+      return !!this.storageFileId;
+    },
+    trim: true,
+  },
+
+  storageFileId: {
+    type: String,
+    required: function requiredStorageFileId() {
+      return this.storageProvider === 'google-drive';
+    },
+    trim: true,
+  },
+  
+  /**
+   * Content checksum (SHA256) for retry-safe deduplication
+   */
+  checksum: {
+    type: String,
+    trim: true,
+  },
+
+  contentHash: {
+    type: String,
+    index: true,
+  },
+
+  isDuplicate: {
+    type: Boolean,
+    default: false,
+  },
+  
+  /**
+   * File size in bytes
+   * Stored for display and validation purposes
+   */
+  size: {
+    type: Number,
+  },
+  
+  /**
+   * Description of the attachment (MANDATORY)
+   */
+  description: {
+    type: String,
+    required: [true, 'Description is required'],
+  },
+  
+  /**
+   * Email of user who uploaded the attachment
+   * ⚠️ DEPRECATED - MAINTAINED FOR BACKWARD COMPATIBILITY ONLY ⚠️
+   * Use createdByXID and createdByName for all purposes including UI display
+   */
+  createdBy: {
+    type: String,
+    required: [true, 'Creator email is required'],
+    lowercase: true,
+    trim: true,
+  },
+  
+  /**
+   * xID of user who uploaded the attachment
+   * ✅ CANONICAL IDENTIFIER ✅
+   * Format: X123456
+   * Used for attribution and audit trails
+   * 
+   * Optional for backward compatibility with existing attachments.
+   * All new attachments should include this field.
+   */
+  createdByXID: {
+    type: String,
+    uppercase: true,
+    trim: true,
+  },
+  
+  /**
+   * Name of user who uploaded the attachment
+   * Used for display in UI
+   * 
+   * Optional for backward compatibility with existing attachments.
+   * All new attachments should include this field.
+   */
+  createdByName: {
+    type: String,
+    trim: true,
+  },
+  
+  /**
+   * Type of attachment
+   * - 'file': Regular uploaded file
+   * - 'email_native': Original email file (.eml, .msg)
+   * - 'email_pdf': PDF conversion of an email
+   * - 'system_generated': System-generated documents
+   */
+  type: {
+    type: String,
+    enum: ['file', 'email_native', 'email_pdf', 'system_generated'],
+    default: 'file',
+  },
+  
+  /**
+   * Source of attachment
+   * - 'upload': Manually uploaded by user
+   * - 'email': Received via inbound email
+   * - 'system': Generated by system
+   * - 'client_cfs': Client-level CFS document (admin-managed)
+   * - 'CLIENT_UPLOAD': Uploaded via external client upload link
+   */
+  source: {
+    type: String,
+    enum: ['upload', 'email', 'system', 'client_cfs', 'CLIENT_UPLOAD'],
+    default: 'upload',
+  },
+  
+  /**
+   * Visibility/classification
+   * - 'internal': Created by internal user (has xID)
+   * - 'external': Created by external party (no xID)
+   */
+  visibility: {
+    type: String,
+    enum: ['internal', 'external'],
+    default: 'internal',
+  },
+  
+  /**
+   * MIME type of the file
+   * Auto-detected based on file extension
+   */
+  mimeType: {
+    type: String,
+    trim: true,
+  },
+
+  emailThreadId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'EmailThread',
+    index: true,
+  },
+
+  compressed: {
+    type: Boolean,
+    default: false,
+  },
+
+  // Size before optional compression (or original size when compression is skipped).
+  originalSize: {
+    type: Number,
+  },
+
+  // Size persisted to storage after optional compression.
+  finalSize: {
+    type: Number,
+  },
+  
+  /**
+   * When the attachment was uploaded
+   * Immutable to prevent tampering
+   */
+  createdAt: {
+    type: Date,
+    default: Date.now,
+    immutable: true,
+  },
+  
+  /**
+   * Optional note (e.g., "Cloned from Case ID: DCK-0042")
+   */
+  note: {
+    type: String,
+  },
+
+  analysis: {
+    documentType: {
+      type: String,
+      trim: true,
+    },
+    extractedFields: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
+    },
+    tags: {
+      type: [String],
+      default: [],
+    },
+    suggestedTeam: {
+      type: String,
+      trim: true,
+    },
+    confidence: {
+      type: Number,
+      min: 0,
+      max: 1,
+      default: 0,
+    },
+    status: {
+      type: String,
+      enum: ['PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'],
+      default: 'PENDING',
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  },
+}, {
+  // Strict mode: Prevents adding arbitrary fields
+  strict: true,
+  // No automatic timestamps - we manage this manually
+  timestamps: false,
+});
+
+/**
+ * Pre-save Hook: Validate attachment ownership
+ * 
+ * Ensures that attachments have proper ownership:
+ * - client_cfs attachments MUST have clientId
+ * - Regular attachments SHOULD have caseId (but can be client-only)
+ * - All attachments must have at least one of clientId or caseId
+ */
+attachmentSchema.pre('save', function(next) {
+  for (const value of Object.values(this.toObject({ depopulate: true }))) {
+    if (Buffer.isBuffer(value)) {
+      return next(new Error('Attachment metadata cannot store binary payloads'));
+    }
+  }
+
+  // Validate client_cfs attachments must have clientId
+  if (this.source === 'client_cfs' && !this.clientId) {
+    return next(new Error('Client CFS attachments must have a clientId'));
+  }
+  
+  // Validate at least one of clientId or caseId is present
+  if (!this.clientId && !this.caseId) {
+    return next(new Error('Attachment must belong to either a client or a case'));
+  }
+
+  if (!this.storageFileId && !this.driveFileId && !this.filePath) {
+    return next(new Error('Invalid attachment: no storage reference'));
+  }
+  
+  next();
+});
+
+/**
+ * Pre-update Hooks: Prevent Updates
+ * 
+ * These hooks block any attempt to update existing attachments.
+ * Attachments must be immutable for audit integrity.
+ */
+attachmentSchema.pre('updateOne', function(next) {
+  next(new Error('Attachments cannot be updated. Attachments are immutable.'));
+});
+
+attachmentSchema.pre('findOneAndUpdate', function(next) {
+  next(new Error('Attachments cannot be updated. Attachments are immutable.'));
+});
+
+attachmentSchema.pre('updateMany', function(next) {
+  next(new Error('Attachments cannot be updated. Attachments are immutable.'));
+});
+
+/**
+ * Pre-delete Hooks: Prevent Deletes
+ * 
+ * These hooks block any attempt to delete attachments.
+ */
+attachmentSchema.pre('deleteOne', function(next) {
+  next(new Error('Attachments cannot be deleted. Attachments are immutable.'));
+});
+
+attachmentSchema.pre('deleteMany', function(next) {
+  next(new Error('Attachments cannot be deleted. Attachments are immutable.'));
+});
+
+attachmentSchema.pre('findOneAndDelete', function(next) {
+  next(new Error('Attachments cannot be deleted. Attachments are immutable.'));
+});
+
+/**
+ * Performance Indexes
+ * - caseId + createdAt: List attachments for a case
+ * - clientId + createdAt: List attachments for a client (client CFS)
+ * - fileName: Full-text search index for global search
+ * - firmId: Multi-tenancy queries
+ */
+attachmentSchema.index({ caseId: 1, createdAt: -1 });
+attachmentSchema.index({ caseId: 1, firmId: 1, createdAt: 1 });
+attachmentSchema.index({ clientId: 1, createdAt: -1 }); // Client CFS attachments
+attachmentSchema.index({ fileName: 'text' });
+// REMOVED: { firmId: 1 } - redundant with compound indexes below
+attachmentSchema.index({ firmId: 1, caseId: 1 }); // Firm-scoped case attachments
+attachmentSchema.index({ firmId: 1, clientId: 1 }); // Firm-scoped client attachments
+attachmentSchema.index({ firmId: 1, caseId: 1, checksum: 1 }, { sparse: true });
+attachmentSchema.index({ firmId: 1, clientId: 1, checksum: 1 }, { sparse: true });
+attachmentSchema.index({ firmId: 1, contentHash: 1 });
+attachmentSchema.index({ firmId: 1, caseId: 1, fileName: 1, version: -1 });
+
+attachmentSchema.plugin(softDeletePlugin);
+attachmentSchema.plugin(tenantScopeGuardPlugin);
+
+module.exports = mongoose.model('Attachment', attachmentSchema);

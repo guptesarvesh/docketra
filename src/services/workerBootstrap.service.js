@@ -1,0 +1,73 @@
+const log = require('../utils/log');
+
+const workerModules = [
+  { name: 'STORAGE_WORKER', path: '../workers/storage.worker' },
+  { name: 'STORAGE_INTEGRITY_WORKER', path: '../workers/storageIntegrity.worker' },
+  { name: 'TENANT_CASE_METRICS_WORKER', path: '../workers/tenantCaseMetrics.worker' },
+  { name: 'EMAIL_WORKER', path: '../workers/email.worker' },
+  { name: 'AUDIT_WORKER', path: '../workers/audit.worker' },
+  { name: 'NOTIFICATION_WORKER', path: '../workers/notification.worker' },
+  { name: 'SLA_WORKER', path: '../workers/sla.worker' },
+  { name: 'BULK_UPLOAD_WORKER', path: '../workers/bulkUpload.worker' },
+  { name: 'OUTBOX_WORKER', path: '../workers/outbox.worker' },
+  { name: 'DOCUMENT_ANALYSIS_WORKER', path: '../workers/documentAnalysis.worker' },
+  { name: 'SLA_CHECK_WORKER', path: '../workers/slaCheck.worker' },
+  { name: 'REPORT_GENERATION_WORKER', path: '../workers/reportGeneration.worker' },
+  { name: 'BULK_PROCESS_WORKER', path: '../workers/bulkProcess.worker' },
+];
+
+const startWorkerModule = ({ name, path }) => {
+  try {
+    const workerModule = require(path);
+    if (!workerModule || workerModule.worker === null) {
+      log.info(`${name}_DISABLED`);
+      return;
+    }
+    log.info(`${name}_STARTED`);
+  } catch (err) {
+    log.warn(`${name}_START_FAILED`, { error: err.message });
+  }
+};
+
+const startBackgroundWorkers = () => {
+  workerModules.forEach((moduleConfig) => {
+    startWorkerModule(moduleConfig);
+  });
+};
+
+const startBackgroundSchedules = () => {
+  const { enqueueDailyStorageIntegrityJob } = require('../queues/storageIntegrity.queue');
+  enqueueDailyStorageIntegrityJob().catch((err) =>
+    log.error('[storageIntegritySchedule] registration failed', { message: err.message })
+  );
+
+  const { runStorageHealthCheck } = require('../jobs/storageHealthCheck.job');
+  const { cleanupStaleTmpUploads } = require('../utils/cleanupTmpUploads');
+  const { storageBackupService } = require('./storageBackup.service');
+
+  setInterval(() => {
+    runStorageHealthCheck().catch((err) =>
+      log.error('[storageHealthCheck] failed', { message: err.message })
+    );
+  }, 8 * 60 * 60 * 1000);
+  setInterval(() => {
+    cleanupStaleTmpUploads().catch((err) =>
+      log.error('[cleanupTmpUploads] failed', { message: err.message })
+    );
+  }, 6 * 60 * 60 * 1000);
+
+  storageBackupService.scheduleNightlyBackups();
+  const { processDocketDueNotifications } = require('./docketDueNotification.service');
+  const dueNotificationsIntervalMs = Math.max(5 * 60 * 1000, Number(process.env.DOCKET_DUE_NOTIFICATION_INTERVAL_MS || 60 * 60 * 1000));
+  setInterval(() => {
+    processDocketDueNotifications().catch((err) =>
+      log.error('[docketDueNotificationSchedule] failed', { message: err.message })
+    );
+  }, dueNotificationsIntervalMs);
+
+};
+
+module.exports = {
+  startBackgroundWorkers,
+  startBackgroundSchedules,
+};

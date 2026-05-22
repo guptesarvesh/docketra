@@ -1,0 +1,63 @@
+/**
+ * Validation Utilities
+ */
+
+export const validateEmail = (email) => {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+};
+
+export const validateXID = (xid) => {
+  // xID should not be empty and should not contain '@' (reject email format)
+  // Format: X followed by 6 digits (e.g., X123456 or x123456)
+  if (!xid || xid.trim().length === 0) {
+    return false;
+  }
+  
+  const trimmedXID = xid.trim();
+  
+  // Reject email format
+  if (trimmedXID.includes('@')) {
+    return false;
+  }
+  
+  // Basic xID format validation (case-insensitive)
+  const xidRegex = /^[xX]\d{6}$/;
+  return xidRegex.test(trimmedXID);
+};
+
+export const validatePassword = (password) => {
+  // Basic password validation
+  return password && password.length >= 8;
+};
+
+export const STRONG_PASSWORD_MESSAGE = 'Password must be at least 8 characters long and include uppercase, lowercase, number, and special character.';
+
+export const validateStrongPassword = (password) => (
+  /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z\d]).{8,}$/.test(password || '')
+);
+
+export const validateRequired = (value) => {
+  if (typeof value === 'string') {
+    return value.trim().length > 0;
+  }
+  return value !== null && value !== undefined;
+};
+
+export const validatePAN = (pan) => {
+  // PAN format: ABCDE1234F
+  const panRegex = /^[A-Z]{5}[0-9]{4}[A-Z]{1}$/;
+  return !pan || panRegex.test(pan);
+};
+
+export const validateAadhaar = (aadhaar) => {
+  // Aadhaar format: 12 digits
+  const aadhaarRegex = /^[0-9]{12}$/;
+  return !aadhaar || aadhaarRegex.test(aadhaar.replace(/\s/g, ''));
+};
+
+export const validatePhone = (phone) => {
+  // Phone format: 10 digits
+  const phoneRegex = /^[0-9]{10}$/;
+  return !phone || phoneRegex.test(phone.replace(/[\s-]/g, ''));
+};

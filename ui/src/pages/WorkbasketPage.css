@@ -1,0 +1,202 @@
+/**
+ * Workbasket Page Styles (formerly Global Worklist)
+ */
+
+/* enterprise-content already provides horizontal padding; only add bottom spacing here */
+.global-worklist {
+  padding: 0 0 2rem;
+  max-width: 1400px;
+  margin: 0 auto;
+  width: 100%;
+  min-width: 0;
+}
+
+.global-worklist__header {
+  margin-bottom: 2rem;
+}
+
+.global-worklist__header h1 {
+  font-size: 2rem;
+  margin-bottom: 0.5rem;
+  color: var(--text-primary);
+}
+
+.global-worklist__filters {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 1rem;
+  margin-bottom: 2rem;
+  padding: 1.5rem;
+  background: var(--bg-secondary);
+  border-radius: 8px;
+}
+
+.filter-group {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.filter-group label {
+  font-size: 0.875rem;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.global-worklist__table-container {
+  overflow-x: auto;
+  margin: 1rem 0;
+}
+
+.global-worklist__bulk-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  padding: 1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.global-worklist__actions-cell {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: flex-end;
+}
+
+.global-worklist__table {
+  width: 100%;
+  border-collapse: collapse;
+  min-width: 800px;
+}
+
+.global-worklist__table th {
+  text-align: left;
+  padding: 1rem;
+  background: var(--bg-secondary);
+  font-weight: 600;
+  border-bottom: 2px solid var(--border-color);
+  white-space: nowrap;
+}
+
+.global-worklist__table td {
+  padding: 1rem;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.global-worklist__col-fit {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.global-worklist__col-name {
+  width: 100%;
+  max-width: 32rem;
+}
+
+.global-worklist__truncate {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.global-worklist__th-center,
+.global-worklist__td-center {
+  text-align: center;
+}
+
+.global-worklist__th-right,
+.global-worklist__td-right {
+  text-align: right;
+}
+
+.global-worklist__table tbody tr:hover {
+  background: var(--bg-secondary);
+}
+
+.global-worklist__pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border-color);
+}
+
+.global-worklist__pagination span {
+  font-size: 0.875rem;
+  color: var(--text-secondary);
+}
+
+/* SLA Status Colors */
+.sla-overdue {
+  color: #dc2626;
+  font-weight: 600;
+}
+
+.sla-due-soon {
+  color: #f59e0b;
+  font-weight: 600;
+}
+
+.sla-on-track {
+  color: #10b981;
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .global-worklist {
+    padding: 0 0 1rem;
+  }
+
+  .global-worklist__filters {
+    grid-template-columns: 1fr;
+  }
+
+  .global-worklist__table {
+    font-size: 0.875rem;
+  }
+
+  .global-worklist__table th,
+  .global-worklist__table td {
+    padding: 0.75rem 0.5rem;
+  }
+}
+
+.docket-link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent-primary, #2563eb);
+  text-decoration: underline;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.docket-link:hover {
+  color: var(--accent-primary-hover, #1d4ed8);
+}
+
+/* Workbasket view-switcher tabs */
+.workbasket-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+  flex-wrap: wrap;
+}
+
+/* Bulk actions bar — only rendered when rows are selected */
+.global-worklist__bulk-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: center;
+  padding: 0.625rem 1rem;
+  background: #f0f9ff;
+  border: 1px solid #bae6fd;
+  border-radius: 8px;
+  margin-bottom: 0.75rem;
+}

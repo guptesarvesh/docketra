@@ -1,0 +1,86 @@
+/**
+ * xID Generator Service
+ * 
+ * Generates unique, sequential xIDs for user accounts
+ * Format: X000001, X000002, X000003, etc.
+ * 
+ * This service ensures:
+ * - Server-side generation only (never client-provided)
+ * - Sequential numbering for easy reference
+ * - Bootstrap-safe (works when database is empty)
+ * - Atomic counter support outside business transactions
+ * - Immutability (xID cannot be changed after creation)
+ * - Race-condition safety via transaction isolation
+ * 
+ * IMPORTANT: Uses global Counter collection key with atomic $inc updates.
+ */
+
+const Counter = require('../models/Counter.model');
+const User = require('../models/User.model');
+const log = require('../utils/log');
+
+/**
+ * Generate the next available xID using an atomic global counter.
+ * 
+ * @param {string|Object} _firmId - Legacy parameter (unused for global xID sequence)
+ * @param {object} session - Legacy parameter retained for compatibility; ignored intentionally
+ * @returns {Promise<string>} Next xID in format X000001
+ */
+const generateNextXID = async (_firmId = null, legacySession = null) => {
+  try {
+    void legacySession;
+    const counter = await Counter.findOneAndUpdate(
+      { name: 'user_xid', firmId: 'GLOBAL' },
+      { $inc: { seq: 1 } },
+      {
+        returnDocument: 'after',
+        upsert: true,
+        setDefaultsOnInsert: true,
+      }
+    );
+
+    const xID = `X${String(counter.seq).padStart(6, '0')}`;
+    
+    log.info(`[xID Generator] Generated xID: ${xID}`);
+    
+    return xID;
+  } catch (error) {
+    log.error('[xID Generator] Error generating xID:', error);
+    throw new Error('Failed to generate xID during firm provisioning');
+  }
+};
+
+/**
+ * Validate xID format
+ * @param {string} xID - xID to validate
+ * @returns {boolean} True if valid format
+ */
+const validateXIDFormat = (xID) => {
+  if (!xID || typeof xID !== 'string') {
+    return false;
+  }
+  
+  // Must match format: X followed by 6 digits
+  return /^X\d{6}$/.test(xID);
+};
+
+/**
+ * Check if xID already exists
+ * @param {string} xID - xID to check
+ * @returns {Promise<boolean>} True if xID exists
+ */
+const xIDExists = async (xID) => {
+  try {
+    const user = await User.findOne({ xID: xID.toUpperCase() }).lean();
+    return !!user;
+  } catch (error) {
+    log.error('[xID Generator] Error checking xID existence:', error);
+    throw new Error('Failed to check xID existence');
+  }
+};
+
+module.exports = {
+  generateNextXID,
+  validateXIDFormat,
+  xIDExists,
+};

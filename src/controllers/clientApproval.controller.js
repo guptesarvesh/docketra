@@ -1,0 +1,672 @@
+const Case = require('../models/Case.model');
+const Comment = require('../models/Comment.model');
+const Client = require('../models/Client.model');
+const CaseHistory = require('../models/CaseHistory.model');
+const { CaseRepository, ClientRepository } = require('../repositories');
+const { CASE_CATEGORIES, CLIENT_STATUS } = require('../config/constants');
+const CaseStatus = require('../domain/case/caseStatus');
+const CaseService = require('../services/case.service');
+const { generateNextClientId } = require('../services/clientIdGenerator');
+const { persistClientProfileOrRollback } = require('../services/clientProfileWriteGuard.service');
+const wrapWriteHandler = require('../middleware/wrapWriteHandler');
+const log = require('../utils/log');
+const { buildClientStatusQuery, CANONICAL_CLIENT_STATUSES } = require('../utils/clientStatus');
+
+const normalizeClientList = (clients) => (Array.isArray(clients) ? clients : []);
+
+const buildClientListResponse = (clients = [], total = 0) => {
+  const normalizedClients = normalizeClientList(clients);
+
+  return {
+    success: true,
+    data: normalizedClients,
+    clients: normalizedClients,
+    total,
+  };
+};
+
+/**
+ * Client Approval Controller
+ * 
+ * Handles case-driven client creation and editing workflows.
+ * All client mutations go through Admin-approved cases.
+ * 
+ * Key Principles:
+ * - NO direct client edit APIs
+ * - All changes via "Client - New" or "Client - Edit" cases
+ * - Admin approval required for DB mutation
+ * - Full audit trail in CaseHistory
+ * - Immutable clientId enforcement
+ */
+
+/**
+ * Approve Client Creation (Client - New case)
+ * POST /api/client-approval/:caseId/approve-new
+ * 
+ * Admin-only endpoint to approve a "Client - New" case
+ * Creates the new client in the database and updates case status
+ * Uses new workflow states and payload structure
+ */
+const approveNewClient = async (req, res) => {
+  try {
+    const { caseId } = req.params;
+    const { comment } = req.body;
+    const approverEmail = (req.approverEmail || req.body?.approverEmail || '').toLowerCase();
+    
+    // Validate required fields
+    if (!approverEmail) {
+      return res.status(400).json({
+        success: false,
+        message: 'Approver email is required',
+      });
+    }
+    
+    if (!comment) {
+      return res.status(400).json({
+        success: false,
+        message: 'Comment is mandatory for approval',
+      });
+    }
+    
+    // Find the case
+    let caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    if (!caseData) {
+      return res.status(404).json({
+        success: false,
+        message: 'Case not found',
+      });
+    }
+    
+    // Verify case category
+    const category = caseData.caseCategory || caseData.category;
+    if (category !== CASE_CATEGORIES.CLIENT_NEW) {
+      return res.status(400).json({
+        success: false,
+        message: 'This endpoint is only for "Client - New" cases',
+      });
+    }
+    
+    // Verify case is in SUBMITTED or UNDER_REVIEW status
+    const validStatuses = [CaseStatus.SUBMITTED, CaseStatus.UNDER_REVIEW, CaseStatus.REVIEWED];
+    if (!validStatuses.includes(caseData.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Case must be in SUBMITTED or UNDER_REVIEW status to approve. Current status: ${caseData.status}`,
+      });
+    }
+    
+    // Extract client data from payload or legacy description
+    let clientData;
+    if (caseData.payload && caseData.payload.clientData) {
+      clientData = caseData.payload.clientData;
+    } else {
+      // Fallback to legacy description format
+      try {
+        clientData = JSON.parse(caseData.description);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid client data format. Expected payload.clientData or JSON in description.',
+        });
+      }
+    }
+    
+    // Validate required client fields
+    const requiredFields = ['businessName', 'primaryContactNumber', 'businessEmail'];
+    const missingFields = requiredFields.filter(field => !clientData[field]);
+    
+    if (missingFields.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: `Missing required client fields: ${missingFields.join(', ')}`,
+      });
+    }
+    
+    // Get approver xID from middleware-provided user object
+    // Note: clientApproval routes use req.approverUser (set by checkClientApprovalPermission middleware)
+    // while direct client routes use req.user (set by authenticate middleware)
+    const approverXid = req.approverUser?.xID;
+    
+    if (!approverXid) {
+      return res.status(500).json({
+        success: false,
+        message: 'Approver xID not found in request context',
+      });
+    }
+    
+    const clientId = await generateNextClientId(req.user.firmId);
+
+    // Create the new client
+    const newClient = await ClientRepository.create({
+      clientId,
+      businessName: clientData.businessName,
+      primaryContactNumber: clientData.primaryContactNumber,
+      businessEmail: clientData.businessEmail,
+      firmId: req.user.firmId,
+      isSystemClient: false,
+      isActive: true,
+      status: CANONICAL_CLIENT_STATUSES.ACTIVE,
+      createdByXid: approverXid,
+      createdBy: approverEmail.toLowerCase(),
+    }, req.user?.role);
+
+    await persistClientProfileOrRollback({
+      firmId: req.user.firmId,
+      client: newClient,
+      actorXID: approverXid,
+      profileInput: {
+        legalName: clientData.businessName,
+        businessAddress: clientData.businessAddress || null,
+        primaryContactNumber: clientData.primaryContactNumber,
+        secondaryContactNumber: clientData.secondaryContactNumber || null,
+        businessEmail: clientData.businessEmail,
+        PAN: clientData.PAN || null,
+        GST: clientData.GST || null,
+        TAN: clientData.TAN || null,
+        CIN: clientData.CIN || null,
+        contactPersonName: clientData.contactPersonName || null,
+        contactPersonDesignation: clientData.contactPersonDesignation || null,
+        contactPersonPhoneNumber: clientData.contactPersonPhoneNumber || null,
+        contactPersonEmailAddress: clientData.contactPersonEmailAddress || null,
+      },
+    });
+    
+    // Update case with approval metadata through centralized service
+    await CaseService.updateStatus(caseId, CaseStatus.APPROVED, {
+      tenantId: req.user.firmId,
+      role: req.user.role,
+      userId: approverXid,
+      performedBy: approverEmail.toLowerCase(),
+      actorRole: req.user.role === 'Admin' ? 'ADMIN' : 'USER',
+      req,
+      currentStatus: caseData.status,
+      statusPatch: {
+        approvedAt: new Date(),
+        approvedBy: approverEmail.toLowerCase(),
+        decisionComments: comment,
+      },
+    });
+    caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    // Add approval comment
+    await Comment.create({
+      caseId,
+      firmId: req.user.firmId,
+      text: comment,
+      createdBy: approverEmail.toLowerCase(),
+      note: 'Admin approval - Client created',
+    });
+    
+    // Create case history entry
+    await CaseHistory.create({
+      caseId,
+      firmId: req.user.firmId,
+      actionType: 'ClientCreated',
+      description: `Client created via case ${caseId}. New Client ID: ${newClient.clientId}`,
+      performedBy: approverEmail.toLowerCase(),
+    });
+    
+    // Also log case approval
+    await CaseHistory.create({
+      caseId,
+      firmId: req.user.firmId,
+      actionType: 'Approved',
+      description: `Case approved by Admin. Client ${newClient.clientId} created successfully.`,
+      performedBy: approverEmail.toLowerCase(),
+    });
+    
+    res.status(200).json({
+      success: true,
+      message: 'Client created successfully',
+      data: {
+        client: newClient,
+        case: caseData,
+      },
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: 'Error approving client creation',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Approve Client Edit (Client - Edit case)
+ * POST /api/client-approval/:caseId/approve-edit
+ * 
+ * Admin-only endpoint to approve a "Client - Edit" case
+ * Updates the existing client in the database and logs changes in audit trail
+ * Uses new workflow states and payload structure
+ */
+const approveClientEdit = async (req, res) => {
+  try {
+    const { caseId } = req.params;
+    const { comment } = req.body;
+    const approverEmail = (req.approverEmail || req.body?.approverEmail || '').toLowerCase();
+    
+    // Validate required fields
+    if (!approverEmail) {
+      return res.status(400).json({
+        success: false,
+        message: 'Approver email is required',
+      });
+    }
+    
+    if (!comment) {
+      return res.status(400).json({
+        success: false,
+        message: 'Comment is mandatory for approval',
+      });
+    }
+    const approverXid = req.approverUser?.xID || req.user?.xID;
+    
+    // Find the case
+    let caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    if (!caseData) {
+      return res.status(404).json({
+        success: false,
+        message: 'Case not found',
+      });
+    }
+    
+    // Verify case category
+    const category = caseData.caseCategory || caseData.category;
+    if (category !== CASE_CATEGORIES.CLIENT_EDIT) {
+      return res.status(400).json({
+        success: false,
+        message: 'This endpoint is only for "Client - Edit" cases',
+      });
+    }
+    
+    // Verify case is in SUBMITTED or UNDER_REVIEW status
+    const validStatuses = [CaseStatus.SUBMITTED, CaseStatus.UNDER_REVIEW, CaseStatus.REVIEWED];
+    if (!validStatuses.includes(caseData.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Case must be in SUBMITTED or UNDER_REVIEW status to approve. Current status: ${caseData.status}`,
+      });
+    }
+    
+    // Extract edit data from payload or legacy description
+    let editData;
+    if (caseData.payload && caseData.payload.clientId && caseData.payload.updates) {
+      editData = {
+        clientId: caseData.payload.clientId,
+        updates: caseData.payload.updates,
+      };
+    } else {
+      // Fallback to legacy description format
+      try {
+        editData = JSON.parse(caseData.description);
+      } catch (error) {
+        return res.status(400).json({
+          success: false,
+          message: 'Invalid edit data format. Expected payload with clientId and updates.',
+        });
+      }
+    }
+    
+    if (!editData.clientId || !editData.updates) {
+      return res.status(400).json({
+        success: false,
+        message: 'Edit data must include clientId and updates fields',
+      });
+    }
+    
+    // Find the client to edit
+    const client = await ClientRepository.findByClientId(req.user.firmId, editData.clientId, req.user.role);
+    
+    if (!client) {
+      return res.status(404).json({
+        success: false,
+        message: `Client ${editData.clientId} not found`,
+      });
+    }
+    
+    // Prevent editing system client directly
+    if (client.isSystemClient) {
+      return res.status(403).json({
+        success: false,
+        message: 'System organization client cannot be edited',
+      });
+    }
+    
+    // Prevent editing clientId (double safety check)
+    if (editData.updates.clientId) {
+      return res.status(403).json({
+        success: false,
+        message: 'clientId is immutable and cannot be changed',
+      });
+    }
+    
+    // Prevent editing isSystemClient flag
+    if (editData.updates.hasOwnProperty('isSystemClient')) {
+      return res.status(403).json({
+        success: false,
+        message: 'isSystemClient flag cannot be changed',
+      });
+    }
+    
+    // Store old values for audit trail
+    const oldValues = {};
+    const changedFields = [];
+    
+    // Apply updates and track changes
+    const allowedFields = [
+      'businessName', 'businessAddress', 'primaryContactNumber', 'secondaryContactNumber', 'businessEmail',
+      'PAN', 'GST', 'TAN', 'CIN', 'isActive'
+    ];
+    
+    for (const field of allowedFields) {
+      if (editData.updates.hasOwnProperty(field)) {
+        oldValues[field] = client[field];
+        client[field] = editData.updates[field];
+        changedFields.push(field);
+      }
+    }
+    
+    if (changedFields.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'No valid fields to update',
+      });
+    }
+    
+    await client.save();
+    
+    // Update case with approval metadata through centralized service
+    await CaseService.updateStatus(caseId, CaseStatus.APPROVED, {
+      tenantId: req.user.firmId,
+      role: req.user.role,
+      userId: approverXid,
+      performedBy: approverEmail.toLowerCase(),
+      actorRole: req.user.role === 'Admin' ? 'ADMIN' : 'USER',
+      req,
+      currentStatus: caseData.status,
+      statusPatch: {
+        approvedAt: new Date(),
+        approvedBy: approverEmail.toLowerCase(),
+        decisionComments: comment,
+      },
+    });
+    caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    // Add approval comment
+    await Comment.create({
+      caseId,
+      firmId: req.user.firmId,
+      text: comment,
+      createdBy: approverEmail.toLowerCase(),
+      note: 'Admin approval - Client updated',
+    });
+    
+    // Create detailed audit trail in case history
+    const changesDescription = changedFields.map(field => {
+      return `${field}: "${oldValues[field]}" → "${client[field]}"`;
+    }).join('; ');
+    
+    await CaseHistory.create({
+      caseId,
+      firmId: req.user.firmId,
+      actionType: 'ClientUpdated',
+      description: `Client ${client.clientId} updated via case ${caseId}. Changes: ${changesDescription}`,
+      performedBy: approverEmail.toLowerCase(),
+    });
+    
+    // Also log case approval
+    await CaseHistory.create({
+      caseId,
+      firmId: req.user.firmId,
+      actionType: 'Approved',
+      description: `Case approved by Admin. Client ${client.clientId} updated successfully.`,
+      performedBy: approverEmail.toLowerCase(),
+    });
+    
+    res.status(200).json({
+      success: true,
+      message: 'Client updated successfully',
+      data: {
+        client,
+        case: caseData,
+        changes: {
+          fields: changedFields,
+          oldValues,
+          newValues: changedFields.reduce((acc, field) => {
+            acc[field] = client[field];
+            return acc;
+          }, {}),
+        },
+      },
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: 'Error approving client edit',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Reject Client Case (New or Edit)
+ * POST /api/client-approval/:caseId/reject
+ * 
+ * Admin-only endpoint to reject a client case
+ * Updates case status but does NOT mutate client data
+ * Uses new workflow states
+ */
+const rejectClientCase = async (req, res) => {
+  try {
+    const { caseId } = req.params;
+    const { comment } = req.body;
+    const approverEmail = (req.approverEmail || req.body?.approverEmail || '').toLowerCase();
+    
+    // Validate required fields
+    if (!approverEmail) {
+      return res.status(400).json({
+        success: false,
+        message: 'Approver email is required',
+      });
+    }
+    
+    if (!comment) {
+      return res.status(400).json({
+        success: false,
+        message: 'Comment is mandatory for rejection',
+      });
+    }
+    const approverXid = req.approverUser?.xID || req.user?.xID;
+    
+    // Find the case
+    let caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    if (!caseData) {
+      return res.status(404).json({
+        success: false,
+        message: 'Case not found',
+      });
+    }
+    
+    // Verify case category
+    const category = caseData.caseCategory || caseData.category;
+    const validCategories = [CASE_CATEGORIES.CLIENT_NEW, CASE_CATEGORIES.CLIENT_EDIT, CASE_CATEGORIES.CLIENT_DELETE];
+    if (!validCategories.includes(category)) {
+      return res.status(400).json({
+        success: false,
+        message: 'This endpoint is only for client-related cases',
+      });
+    }
+    
+    // Verify case is in SUBMITTED or UNDER_REVIEW status
+    const validStatuses = [CaseStatus.SUBMITTED, CaseStatus.UNDER_REVIEW, CaseStatus.REVIEWED];
+    if (!validStatuses.includes(caseData.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Case must be in SUBMITTED or UNDER_REVIEW status to reject. Current status: ${caseData.status}`,
+      });
+    }
+    
+    // Update case with rejection metadata through centralized service
+    await CaseService.updateStatus(caseId, CaseStatus.REJECTED, {
+      tenantId: req.user.firmId,
+      role: req.user.role,
+      userId: approverXid,
+      performedBy: approverEmail.toLowerCase(),
+      actorRole: req.user.role === 'Admin' ? 'ADMIN' : 'USER',
+      req,
+      currentStatus: caseData.status,
+      statusPatch: {
+        approvedAt: new Date(),
+        approvedBy: approverEmail.toLowerCase(),
+        decisionComments: comment,
+      },
+    });
+    caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    // Add rejection comment
+    await Comment.create({
+      caseId,
+      firmId: req.user.firmId,
+      text: comment,
+      createdBy: approverEmail.toLowerCase(),
+      note: 'Admin rejection - No changes made',
+    });
+    
+    // Create case history entry
+    await CaseHistory.create({
+      caseId,
+      firmId: req.user.firmId,
+      actionType: 'Rejected',
+      description: `Case rejected by Admin. No client changes made. Reason: ${comment}`,
+      performedBy: approverEmail.toLowerCase(),
+    });
+    
+    res.status(200).json({
+      success: true,
+      message: 'Client case rejected - no changes made to client data',
+      data: {
+        case: caseData,
+      },
+    });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: 'Error rejecting client case',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get Client by ClientId
+ * GET /api/client-approval/clients/:clientId
+ * 
+ * Read-only endpoint to fetch client details
+ * No mutations allowed - for display purposes only
+ */
+const getClientById = async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    
+    const client = await Client.findOne({ clientId, firmId: req.user?.firmId, isActive: true });
+    
+    if (!client) {
+      return res.status(404).json({
+        success: false,
+        message: 'Client not found',
+      });
+    }
+    
+    res.status(200).json({
+      success: true,
+      data: client,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching client',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * List All Clients
+ * GET /api/client-approval/clients
+ * 
+ * Read-only endpoint to list ACTIVE clients for case creation
+ * Returns only clientId and businessName fields, sorted by clientId
+ * No mutations allowed - for display purposes only
+ * 
+ * PR: Client Lifecycle Enforcement
+ * - Only returns active clients by default (legacy ACTIVE + canonical active)
+ * - Sorted by clientId (ascending) for predictable ordering
+ * - Minimal field projection for performance
+ * 
+ * Query Parameters:
+ * - includeInactive: Optional flag to include inactive clients
+ *   Use case: Admin client management pages that need to display all clients
+ *   DO NOT use for case creation dropdowns - only ACTIVE clients should be available
+ */
+const listClients = async (req, res) => {
+  try {
+    const { page = 1, limit = 20, includeInactive = false } = req.query;
+    const adminFirmId = req.user?.firmId;
+    
+    // For case creation dropdown: only ACTIVE clients, unless explicitly requesting all
+    // This enforces client lifecycle rules - deactivated clients cannot be used for new cases
+    const query = {
+      firmId: adminFirmId,
+      ...(includeInactive === 'true' ? {} : { status: buildClientStatusQuery(CLIENT_STATUS.ACTIVE) }),
+    };
+    
+    // PERFORMANCE: Execute independent queries concurrently
+    const [clients, total] = await Promise.all([
+      Client.find(query)
+        .select('clientId businessName businessEmail primaryContactNumber status isActive createdAt')
+        .limit(parseInt(limit))
+        .skip((parseInt(page) - 1) * parseInt(limit))
+        .sort({ clientId: 1 })
+        .lean(),
+      Client.countDocuments(query)
+    ]);
+    const normalizedClients = normalizeClientList(clients);
+    
+    res.status(200).json({
+      success: true,
+      data: normalizedClients,
+      clients: normalizedClients,
+      total,
+      pagination: {
+        page: parseInt(page),
+        limit: parseInt(limit),
+        total,
+        pages: Math.ceil(total / parseInt(limit)),
+      },
+    });
+  } catch (error) {
+    log.error('CLIENT_LIST_ERROR', {
+      firmId: req.user?.firmId || null,
+      requestId: req.requestId || req.headers?.['x-request-id'] || null,
+      userId: req.user?._id || req.user?.id || null,
+      route: req.originalUrl || req.url || null,
+      error: error.message,
+    });
+    res.status(500).json({
+      success: false,
+      message: 'Error fetching clients',
+    });
+  }
+};
+
+module.exports = {
+  approveNewClient: wrapWriteHandler(approveNewClient),
+  approveClientEdit: wrapWriteHandler(approveClientEdit),
+  rejectClientCase: wrapWriteHandler(rejectClientCase),
+  getClientById,
+  listClients,
+};

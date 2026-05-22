@@ -1,0 +1,187 @@
+/**
+ * @deprecated Legacy neo-* compatibility bridge.
+ *
+ * Keep this file during incremental migration while live routes still render neo-* classes.
+ * Do not add new neo-* usage; migrate route-by-route to shared tokenized primitives, then remove.
+ */
+
+.neo-card,
+.neo-section,
+.neo-inset {
+  background: var(--dt-surface);
+  border: 1px solid var(--dt-border);
+  border-radius: var(--dt-radius-card);
+  box-shadow: none;
+}
+
+.neo-card,
+.neo-section {
+  padding: var(--spacing-lg);
+}
+
+.neo-card:hover,
+.neo-section:hover {
+  background: var(--dt-surface-subtle);
+  border-color: var(--dt-border-strong);
+  box-shadow: none;
+}
+
+.neo-button,
+.neo-btn {
+  background: var(--dt-surface);
+  border: 1px solid var(--dt-border-strong);
+  border-radius: var(--dt-radius-control);
+  color: var(--dt-text);
+  cursor: pointer;
+  font-family: var(--font-family);
+  font-size: var(--font-size-sm);
+  font-weight: 500;
+  padding: var(--spacing-sm) var(--spacing-md);
+  transition: background-color var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+  outline: none;
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  letter-spacing: 0.01em;
+  box-shadow: none;
+}
+
+.neo-button:hover:not(:disabled),
+.neo-btn:hover:not(:disabled) {
+  background: var(--dt-bg);
+  border-color: var(--dt-border-strong);
+}
+
+.neo-button:active:not(:disabled),
+.neo-btn:active:not(:disabled) {
+  background: var(--dt-surface-muted);
+}
+
+.neo-button:focus-visible,
+.neo-btn:focus-visible,
+.neo-input:focus {
+  box-shadow: var(--dt-focus-ring);
+  outline: none;
+}
+
+.neo-button:disabled,
+.neo-btn:disabled {
+  color: var(--dt-text-muted);
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.neo-button--primary,
+.neo-btn--primary {
+  background: var(--dt-accent);
+  color: var(--dt-text-inverse);
+  border-color: var(--dt-accent);
+}
+
+.neo-button--primary:hover:not(:disabled),
+.neo-btn--primary:hover:not(:disabled) {
+  background: var(--dt-accent-hover);
+  border-color: var(--dt-accent-hover);
+}
+
+.neo-button--danger {
+  background: var(--dt-error);
+  color: var(--dt-text-inverse);
+  border-color: var(--dt-error);
+}
+
+.neo-button--success {
+  background: var(--dt-success);
+  color: var(--dt-text-inverse);
+  border-color: var(--dt-success);
+}
+
+.neo-input {
+  background: var(--dt-surface);
+  border: 1px solid var(--dt-border-whisper);
+  border-radius: var(--dt-radius-control);
+  color: var(--dt-text);
+  font-family: var(--font-family);
+  font-size: var(--font-size-sm);
+  padding: var(--spacing-sm) var(--spacing-md);
+  transition: border-color var(--transition-fast), box-shadow var(--transition-fast), background-color var(--transition-fast);
+  width: 100%;
+  outline: none;
+  min-height: 38px;
+  line-height: var(--line-height-normal);
+  box-shadow: none;
+}
+
+.neo-input:hover:not(:disabled) {
+  background: var(--dt-surface-muted);
+  border-color: var(--dt-border-strong);
+}
+
+.neo-input:disabled {
+  color: var(--dt-text-muted);
+  cursor: not-allowed;
+  opacity: 0.65;
+  background: var(--dt-bg);
+}
+
+.neo-input::placeholder {
+  color: var(--dt-text-muted);
+}
+
+.neo-badge {
+  background: var(--status-neutral-bg);
+  border: 1px solid var(--status-neutral-border, var(--dt-border));
+  border-radius: var(--dt-radius-pill);
+  color: var(--status-neutral-color);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--dt-font-size-caption);
+  font-weight: 500;
+  padding: 2px 8px;
+  letter-spacing: 0;
+  white-space: nowrap;
+  box-shadow: none;
+}
+
+.neo-badge--success {
+  color: var(--badge-resolved-color);
+  background: var(--badge-resolved-bg);
+  border-color: var(--badge-resolved-border);
+}
+
+.neo-badge--warning {
+  color: var(--badge-pended-color);
+  background: var(--badge-pended-bg);
+  border-color: var(--badge-pended-border);
+}
+
+.neo-badge--danger {
+  color: var(--badge-unassigned-color);
+  background: var(--badge-unassigned-bg);
+  border-color: var(--badge-unassigned-border);
+}
+
+.neo-badge--primary {
+  color: var(--badge-open-color);
+  background: var(--badge-open-bg);
+  border-color: var(--badge-open-border);
+}
+
+.neo-badge--neutral {
+  color: var(--badge-filed-color);
+  background: var(--badge-filed-bg);
+  border-color: var(--badge-filed-border);
+}
+
+.neo-section__header {
+  border-bottom: 1px solid var(--dt-border-whisper);
+  color: var(--dt-text);
+  font-size: var(--dt-font-size-body);
+  font-weight: 600;
+  margin-bottom: var(--spacing-md);
+  padding-bottom: var(--spacing-md);
+  letter-spacing: -0.01em;
+}

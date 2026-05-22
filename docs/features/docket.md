@@ -1,0 +1,364 @@
+# Docket Features
+
+## CRM ↔ Task Manager linkage improvements (April 2026)
+
+To strengthen client context while executing dockets, the following UX/data-link upgrades were added without introducing new backend modules:
+
+- **Client Workspace now acts as a client hub** with:
+  - client identity/contact/state summary
+  - docket rollups (`total`, `open`, `filed/resolved`)
+  - recent dockets snapshot
+  - richer client-specific docket table columns (docket ID, title, category/subcategory, status, assignee, updated date, open action)
+  - quick action to **Create Docket for Client**
+- **Create Docket flow now supports prefilled client context** when opened from client workspace:
+  - route supports `?clientId=<id>`
+  - guided create form prefers the provided client when available and valid
+  - default behavior remains backward compatible when no `clientId` is supplied
+- **Docket Detail now surfaces stronger client context**:
+  - linked client name is now clearly navigable to Client Workspace
+  - dedicated Client Context panel with compact summary (ID/email/contact/context)
+  - in-context actions: open client workspace, create new docket for that client, return to client workspace
+  - lightweight related dockets list for the same client in Overview
+- **Internal work behavior remains explicit**:
+  - internal dockets show clear “internal/default client context” messaging
+  - client navigation actions are only shown where client-linked context is valid
+
+These updates preserve existing permissions, existing API surface, and queue→docket navigation behavior while reducing context switching friction.
+
+
+## Docket context model (Client / Employee / Internal)
+
+Dockets can carry one of three subject-context modes:
+
+- **Client context**: docket is for a linked client.
+- **Employee context (optional)**: docket is about an employee (`employeeXID` + optional snapshot metadata).
+- **Internal/default firm context**: docket is internal and not client-bound.
+
+Role clarity in execution:
+
+- **Employee** = subject of the docket (who the work is about).
+- **Assignee** = owner/executor of the docket work.
+- **Workbasket** = queue/team responsible for routing and operational ownership.
+
+Employee and Assignee are intentionally independent fields and can differ.
+
+## Guided Docket Creation Flow
+
+The Create Docket experience now uses a guided, 5-step workflow designed for faster and clearer docket intake.
+
+### Steps overview
+
+1. **Basic Info**
+   - `title` (required)
+   - `description` (optional)
+2. **Classification**
+   - `category` (optional)
+   - `subcategory` (optional, validated against selected category)
+3. **Routing**
+   - `workbasket` (required)
+   - `priority` (optional, defaults to `Medium`)
+4. **Assignment**
+   - `assignedTo` (optional)
+   - if empty, the backend auto-assigns based on workbasket rules (manager fallback)
+5. **Review & Create**
+   - confirms a full summary before submission
+
+### API contract
+
+`POST /api/dockets/create`
+
+```json
+{
+  "title": "GST Filing Follow-up",
+  "description": "Client follow-up for pending filing",
+  "categoryId": "<optional>",
+  "subcategoryId": "<optional>",
+  "workbasketId": "<required>",
+  "priority": "medium",
+  "assignedTo": "X000123"
+}
+```
+
+Response:
+
+```json
+{
+  "success": true,
+  "message": "Docket created successfully",
+  "data": {
+    "docketId": "CASE-20260414-00001"
+  }
+}
+```
+
+## Default Firm Setup
+
+When a new firm is created (or a firm has no category/workbasket setup), the platform auto-provisions a zero-configuration docket setup so teams can create dockets immediately.
+
+### Default categories and subcategories
+
+- **Compliance**
+  - GST Filing → Compliance Team
+  - ROC Filing → Compliance Team
+- **Tax**
+  - Income Tax Return → Tax Team
+  - TDS Filing → Tax Team
+- **Internal**
+  - Admin Task → General
+  - Follow-up → General
+
+All default categories/subcategories are created as active. Subcategories are created with explicit workbasket mappings to guarantee guided routing works from day one.
+
+### Default workbaskets
+
+- **General**
+- **Compliance Team**
+- **Tax Team**
+
+All default workbaskets are created as active under the firm and are auto-managed by the primary admin user created during onboarding.
+
+### Mapping logic and safety
+
+- Setup is idempotent: re-running firm setup does not create duplicates.
+- Setup executes transactionally when called inside an existing transaction/session.
+- Existing firms are not disrupted: setup only auto-runs for new firms or firms missing category/workbasket setup, unless explicitly forced by reset/clone flows.
+- Superadmin template customization and clone/reset flows are supported by the firm setup service layer for controlled rollout.
+
+### Notes
+
+- Existing `POST /api/cases` continues to work for backward compatibility.
+- Database collection names and historical identifiers may still use `Case` naming where migration risk is high.
+- Screenshots should be captured during manual QA in environments where browser tooling is available.
+
+## Dashboard Overview
+
+The firm dashboard is now action-oriented and loaded from `GET /api/dashboard/summary`.
+
+### Widgets
+
+- **My Dockets**: current-user or filtered (`MY`, `TEAM`, `ALL`) open/in-progress dockets (paginated).
+- **Overdue Dockets**: SLA-breached dockets highlighted with red SLA indicators.
+- **Recently Created**: latest firm-wide dockets (paginated).
+- **Workbasket Load**: lightweight list of open docket count per workbasket.
+
+### UX enhancements
+
+- Filter tabs: **My / Team / All**.
+- Quick action: **Create Docket** button on dashboard header.
+- SLA badges per docket: `GREEN`, `YELLOW`, `RED`.
+- List pagination with page-aware API params (`page`, `limit`).
+- Loading and empty states with safe fallback rendering.
+- Sort controls: `NEWEST`, `PRIORITY`, `SLA`.
+- Workbasket filter dropdown for focused dashboard views.
+- Widget-level lazy loading via `only` query option (each widget can load independently).
+- "View All" links for every dashboard widget to jump into the full docket list.
+
+### Dashboard caching
+
+- `GET /api/dashboard/summary` now uses Redis caching with a 30 second TTL.
+- Cache key includes firm, user, filter, sort, workbasket, page, limit, and widget scope:
+  - `dashboard:{firmId}:{userId}:{filter}:{sort}:{workbasket}:{page}:{limit}:{only}`
+- Only successful responses are cached.
+- Redis failures are non-blocking and fail silently (request still succeeds).
+
+## Activity Timeline
+
+Each docket now has a lightweight, paginated activity timeline exposed at:
+
+- `GET /api/dockets/:id/timeline`
+
+### Timeline events
+
+Supported activity types:
+
+- `DOCKET_CREATED`
+- `STATUS_CHANGED`
+- `ASSIGNED`
+- `WORKBASKET_CHANGED`
+- `PRIORITY_CHANGED`
+- `COMMENT_ADDED`
+- `UPDATED`
+
+### Timeline UX
+
+- Vertical timeline on docket detail page.
+- Latest-first ordering.
+- Event icon per activity type.
+- Actor display with xID and resolved user name when available.
+- Filter tabs for:
+  - Status changes
+  - Assignments
+  - Comments
+- Pagination support for long timelines.
+
+### Naming standard
+
+To reduce confusion during the Docket/Case transition:
+
+- API payloads for list/detail surfaces should expose:
+  - `docketId`
+  - `title`
+- UI should avoid depending on legacy `caseName` / `caseId` fields directly where mapped docket fields are available.
+
+## Firm Setup Observability
+
+Firm setup now exposes explicit completion state and setup metadata.
+
+### Persistence
+
+`Firm` model now tracks:
+
+- `isSetupComplete` (indexed boolean)
+- `setupMetadata.categories`
+- `setupMetadata.workbaskets`
+- `setupMetadata.templateKey`
+- `setupMetadata.completedAt`
+
+### Setup lifecycle behavior
+
+`setupDefaultFirm` now emits structured logs and state transitions:
+
+- `setup started`
+- `setup skipped`
+- `setup completed`
+- `setup failed`
+
+Each log includes `firmId`, relevant counts, and reason/context.
+
+On successful setup, the system sets `isSetupComplete=true` and persists setup metadata. On failure, the setup-complete flag is not set.
+
+### Audit trail
+
+A setup completion audit entry is recorded with description:
+
+`Firm initialized with default setup`
+
+Metadata includes:
+
+- `categoriesCreated`
+- `workbasketsCreated`
+- `templateKey`
+
+### Setup status endpoint
+
+`GET /api/firm/setup-status`
+
+Response shape:
+
+```json
+{
+  "success": true,
+  "data": {
+    "isSetupComplete": true,
+    "lastSetup": {
+      "categories": 3,
+      "workbaskets": 3,
+      "templateKey": "SYSTEM_DEFAULT"
+    }
+  }
+}
+```
+
+UI can use this endpoint to surface a non-blocking banner when setup is incomplete: **"Your workspace is being prepared..."**.
+
+## Bulk Upload Flow
+
+Bulk upload for dockets now follows a safer workflow:
+
+1. **Upload CSV** (`title`, `description`, `category`, `subcategory`, `workbasket`, `priority`)
+2. **Preview & Validation** using `POST /api/dockets/bulk/preview`
+3. **Fix Errors** (download row-level error report or re-upload corrected CSV)
+4. **Confirm Upload** using `POST /api/dockets/bulk/upload`
+
+### Validation rules
+
+Per row:
+
+- Required:
+  - `title`
+  - `workbasket` (must exist and be active)
+- Optional:
+  - `category` (must exist and be active if provided)
+  - `subcategory` (must belong to selected category if provided)
+  - `priority` (`LOW`, `MEDIUM`, `HIGH`)
+
+Preview returns each row with:
+
+- `rowIndex`
+- `isValid`
+- `normalizedData` (for valid rows)
+- `errors[]` (for invalid rows)
+
+### Sample CSV
+
+```csv
+title,description,category,subcategory,workbasket,priority
+GST filing follow-up,Follow up with client,Compliance,GST Filing,Compliance Team,HIGH
+Prepare ROC forms,Q1 filing pack,Compliance,ROC Filing,Compliance Team,MEDIUM
+```
+
+### Upload behavior
+
+- Upload endpoint accepts previewable rows and always re-validates server-side.
+- Invalid rows can be skipped (`uploadValidRowsOnly=true`) or upload can be rejected (`rejectOnInvalid=true`).
+- Response includes `created`, `failed`, and `errors` for full transparency.
+
+## Notifications System
+
+The docket workflow now includes lightweight in-app notifications (polling based, no WebSocket requirement yet).
+
+### Event coverage
+
+- Docket assigned → assignee receives `DOCKET_ASSIGNED`.
+- Docket status changed → relevant users receive `STATUS_CHANGED`.
+- Comment added → docket participants receive `COMMENT_ADDED`.
+- Docket reassigned → new assignee receives `DOCKET_REASSIGNED`.
+
+### API
+
+- `GET /api/notifications`
+- `POST /api/notifications/:id/read`
+
+Response shape:
+
+```json
+{
+  "success": true,
+  "data": []
+}
+```
+
+### UX
+
+- Notification bell in the top navbar.
+- Unread count badge.
+- Dropdown with latest-first notifications and empty state text: `No notifications`.
+- Notification rows can be marked read and navigate to docket detail.
+- Read vs unread state is visually differentiated (bold for unread).
+
+### Enhancements roadmap
+
+- Grouping support merges rapid repeated updates into a single unread item.
+- Real-time push updates can be added later with WebSocket/SSE.
+- Email notification toggle is supported at model/service level for phased rollout.
+## SLA Tracking System
+
+Dockets now support firm-scoped SLA rules with automatic deadline tracking.
+
+### Rule resolution
+
+- Rules are configured per firm.
+- Supported scopes: default, workbasket, category, and subcategory.
+- Resolution order: `subcategory` → `category` → `workbasket` → `default`.
+
+### Runtime behavior
+
+- Docket creation resolves the active SLA rule and stores `slaDueAt`.
+- Due dates are calculated in working hours and skip weekends.
+- SLA status is exposed as `GREEN`, `YELLOW`, or `RED`.
+- Overdue dockets can trigger breach notifications in the dashboard workflow.
+
+### Reporting
+
+- Weekly SLA summaries are available from the reports dashboard.
+- Managers can see current overdue items, due-soon items, and resolved-within-SLA totals at a glance.

@@ -1,0 +1,57 @@
+# Team Management Settings Hardening Audit (2026-05)
+
+## Scope
+Frontend and backend team-management surfaces were audited and hardened for private-pilot readiness across role assignment, status changes, workbasket/QC mapping, and schema strictness.
+
+## Role matrix
+- Primary Admin (non-assignable, exactly one per firm, inherits Admin).
+- Admin (assignable).
+- Manager (assignable).
+- Employee/User (assignable UI alias -> backend `USER`).
+- SuperAdmin is platform-only and excluded from firm role assignment.
+
+## Assignable role contract
+Assignable roles in Team Management are: `Admin`, `Manager`, `Employee` (canonicalized to `USER`).
+Primary Admin and SuperAdmin are explicitly non-assignable.
+
+## Hardening changes
+- Enforced Team Management denial copy consistency: "Admin access is required to manage team members.".
+- Updated empty state copy to: "No team members added yet".
+- Hardened admin route validation schemas for user create/status/workbasket mutation endpoints with strict payload contracts.
+- Removed primary-admin-only gate from activate/deactivate/workbasket assignment endpoints so Admin can manage non-primary users while existing primary-admin protections in business logic remain in effect.
+
+## Workbasket / QC behavior
+- Team create/edit flows continue to require at least one workbasket assignment.
+- QC workbasket assignment remains explicit and optional.
+- Sidebar/deep route access continues to be assignment-driven.
+
+## Bulk upload role contract
+- Allowed roles: Admin, Manager, Employee.
+- Employee canonicalization to backend `USER` remains required.
+- Primary Admin and SuperAdmin remain invalid in bulk role assignment contract.
+
+## Tests run
+- `node ui/tests/adminSurfaceHardening.test.mjs` (initially failed due legacy path mismatch; fixed in PR #1339 follow-up and now passing)
+- `node ui/tests/teamManagementHardening.test.mjs`
+
+## Remaining limitations
+- Full row-level bulk upload partial-failure UX depends on existing bulk pipeline implementation details.
+- Audit event payload parity for every action should continue to be expanded in service-level tests.
+
+## Readiness score
+**8.5 / 10** for private pilot, with core role-boundary and schema-hardening controls in place.
+
+## Team Management Client Access Hardening (May 2026)
+- Team Management user access modal now supports explicit client access modes: `All clients` and `Selected clients only` for Admin/Primary Admin actors.
+- Primary Admin target accounts are non-editable for client restriction through normal Team Management flows.
+- Backend `PATCH /api/admin/users/:xID/restrict-clients` now uses strict mode payloads (`ALL` or `SELECTED`) and validates selected client IDs against firm ownership.
+
+
+## Team & Access authorization policy (2026-05-17)
+- Read endpoints for Team & Access are firm-admin scoped and must allow both `PRIMARY_ADMIN` and `ADMIN`:
+  - `GET /api/admin/users`
+  - `GET /api/admin/stats`
+  - `GET /api/admin/workbaskets`
+  - `GET /api/admin/hierarchy`
+- Sensitive owner/security mutations remain `PRIMARY_ADMIN`-only (for example hierarchy mutations and primary-admin-gated settings/security routes).
+- Frontend error copy must not treat `403` authorization failures as connectivity failures; use permission-specific messaging for `403`, session-expired messaging for `401`, and reserve connectivity copy for network/no-response failures.

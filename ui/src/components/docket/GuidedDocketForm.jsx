@@ -1,0 +1,530 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Input } from '../common/Input';
+import { Select } from '../common/Select';
+import { Textarea } from '../common/Textarea';
+import { Button } from '../common/Button';
+import { Card } from '../common/Card';
+import { categoryService } from '../../services/categoryService';
+import { adminApi } from '../../api/admin.api';
+import { caseApi } from '../../api/case.api';
+import { clientApi } from '../../api/client.api';
+import { useToast } from '../../hooks/useToast';
+import { useUnsavedChangesPrompt } from '../../hooks/useUnsavedChangesPrompt';
+import { buildCreateDocketPayload, validateCreateDocketPayload, resolveEarliestErrorStep } from './createDocketPayload';
+import { ROUTES } from '../../constants/routes';
+import { generateSecureRandomString } from '../../utils/crypto';
+
+const STEPS = ['Basic Info', 'Classification', 'Routing', 'Assignment', 'Review & Create'];
+const createSubmissionKey = () => {
+  return `docket-create-${Date.now()}-${generateSecureRandomString(8)}`;
+};
+
+const defaultForm = {
+  title: '',
+  description: '',
+  categoryId: '',
+  subcategoryId: '',
+  clientId: '',
+  workbasketId: '',
+  priority: 'medium',
+  assignedTo: '',
+  employeeXID: '',
+  relatedEmployeeUserId: '',
+  idempotencyKey: '',
+};
+
+const isEmailLikeError = (message) => typeof message === 'string' && message.toLowerCase().includes('validation');
+const FIELD_TO_STEP = {
+  title: 0,
+  workType: 0,
+  clientId: 0,
+  categoryId: 1,
+  subcategoryId: 1,
+  workbasketId: 2,
+  priority: 2,
+  assignedTo: 3,
+  employeeXID: 3,
+  relatedEmployeeUserId: 3,
+};
+
+export const GuidedDocketForm = ({ onCreated, onCancel, initialClientId = '' }) => {
+  const { showError } = useToast();
+  const [step, setStep] = useState(0);
+  const [submitError, setSubmitError] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
+  const [formData, setFormData] = useState(defaultForm);
+  const [errors, setErrors] = useState({});
+  const [categories, setCategories] = useState([]);
+  const [subcategories, setSubcategories] = useState([]);
+  const [workbaskets, setWorkbaskets] = useState([]);
+  const [users, setUsers] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [loading, setLoading] = useState({ categories: true, workbaskets: true, users: true, clients: true, submit: false });
+  const [clientLoadIssue, setClientLoadIssue] = useState('');
+  const [dependencyErrors, setDependencyErrors] = useState({});
+  const [setupChecklistCollapsed, setSetupChecklistCollapsed] = useState(true);
+  const [suggestion, setSuggestion] = useState(null);
+  const [manualClassification, setManualClassification] = useState(false);
+  const latestSuggestionRequestRef = useRef(0);
+
+  const isDirty = useMemo(() => {
+    return Boolean(
+      formData.title.trim()
+      || formData.description.trim()
+      || formData.categoryId
+      || formData.subcategoryId
+      || formData.assignedTo
+      || formData.clientId
+      || formData.relatedEmployeeUserId
+    );
+  }, [formData]);
+
+  const { confirmLeaveIfDirty } = useUnsavedChangesPrompt({
+    isDirty,
+    isEnabled: !loading.submit,
+    message: 'You have unsaved docket details. Leave this flow without creating the docket?',
+  });
+
+  const loadDeps = useCallback(async () => {
+      setStatusMessage('Loading form dependencies…');
+      setSubmitError('');
+      setDependencyErrors({});
+      setClientLoadIssue('');
+      const [categoryResponse, workbasketResponse, usersResponse, clientResponse] = await Promise.allSettled([
+          categoryService.getCategories(true),
+          adminApi.listWorkbaskets({ activeOnly: true }),
+          caseApi.getDocketEligibleUsers(),
+          clientApi.getClients(true, true),
+      ]);
+      const nextErrors = {};
+
+      const nextCategories = categoryResponse.status === 'fulfilled' ? (categoryResponse.value?.data || []) : [];
+      const nextWorkbaskets = workbasketResponse.status === 'fulfilled' ? (workbasketResponse.value?.data || []) : [];
+      const nextUsers = usersResponse.status === 'fulfilled' ? (usersResponse.value?.data || []) : [];
+      const nextClients = clientResponse.status === 'fulfilled'
+        ? (clientResponse.value?.data || []).filter((item) => item?.isActive !== false)
+        : [];
+
+      if (categoryResponse.status === 'rejected') nextErrors.categories = 'Categories could not be loaded.';
+      if (workbasketResponse.status === 'rejected') nextErrors.workbaskets = 'Workbaskets could not be loaded.';
+      if (usersResponse.status === 'rejected') nextErrors.users = 'Users could not be loaded.';
+      if (clientResponse.status === 'rejected') {
+        const message = clientResponse.reason?.message || '';
+        if (message.includes('TENANT_KEY_MISSING')) {
+          setClientLoadIssue('Client encryption setup needs repair before clients can be loaded.');
+          nextErrors.clients = 'Client setup repair required.';
+        } else {
+          nextErrors.clients = 'Clients could not be loaded.';
+        }
+      }
+
+      setCategories(nextCategories);
+      setWorkbaskets(nextWorkbaskets);
+      setUsers(nextUsers);
+      setClients(nextClients);
+      setDependencyErrors(nextErrors);
+
+      setFormData((prev) => {
+        const firmDefaultClientId = nextClients.find((item) => item.isDefaultClient || item.isSystemClient || item.isInternal || item.clientId === 'C000001')?.clientId || '';
+        const preferredClientId = initialClientId && nextClients.some((item) => item.clientId === initialClientId)
+          ? initialClientId
+          : '';
+        return {
+          ...prev,
+          clientId: prev.clientId || preferredClientId || firmDefaultClientId || nextClients[0]?.clientId || '',
+          workbasketId: prev.workbasketId || nextWorkbaskets[0]?._id || '',
+          idempotencyKey: prev.idempotencyKey || createSubmissionKey(),
+        };
+      });
+      setStatusMessage('');
+      setLoading({ categories: false, workbaskets: false, users: false, clients: false, submit: false });
+  }, [initialClientId]);
+
+  useEffect(() => {
+    loadDeps();
+  }, [loadDeps]);
+
+  useEffect(() => {
+    const selected = categories.find((item) => item._id === formData.categoryId);
+    const nextSubcategories = (selected?.subcategories || []).filter((item) => item.isActive);
+    setSubcategories(nextSubcategories);
+
+    let nextSubcategoryId = formData.subcategoryId;
+    if (!nextSubcategories.find((item) => item.id === formData.subcategoryId)) {
+      nextSubcategoryId = '';
+    }
+
+    const selectedSubcategory = nextSubcategories.find((item) => item.id === nextSubcategoryId);
+    const mappedWorkbasketId = selectedSubcategory?.workbasketId ? String(selectedSubcategory.workbasketId) : '';
+
+    setFormData((prev) => ({
+      ...prev,
+      subcategoryId: nextSubcategoryId,
+      workbasketId: mappedWorkbasketId || prev.workbasketId || workbaskets[0]?._id || '',
+      employeeXID: nextSubcategoryId ? prev.employeeXID : '',
+    }));
+  }, [categories, formData.categoryId, formData.subcategoryId, workbaskets]);
+
+  const selectedClient = clients.find((item) => item.clientId === formData.clientId);
+  const defaultClient = clients.find((item) => item.isDefaultClient || item.isSystemClient || item.isInternal || item.clientId === 'C000001');
+  const hasActiveClients = clients.length > 0;
+  const hasActiveSubcategory = categories.some((item) => (item.subcategories || []).some((sub) => sub.isActive));
+  const hasRoutingPrerequisites = hasActiveSubcategory && workbaskets.length > 0;
+  const selectedSubcategory = subcategories.find((item) => item.id === formData.subcategoryId);
+  const employeeContextEnabled = selectedSubcategory?.employeeContextEnabled === true;
+  const relatedEmployeeUserRequired = selectedSubcategory?.requiresRelatedEmployeeUser === true
+    || categories.find((item) => item._id === formData.categoryId)?.requiresRelatedEmployeeUser === true;
+  const activeUsers = users.filter((item) => item?.status === 'active' && item?.isActive !== false);
+  const relatedEmployeeUsers = users.filter((item) => (item?._id || item?.id) && String(item?.status || '').toLowerCase() !== 'deleted');
+  const selectedEmployee = activeUsers.find((item) => item.xID === formData.employeeXID);
+  const selectedRelatedEmployeeUser = relatedEmployeeUsers.find((item) => String(item?._id || item?.id) === String(formData.relatedEmployeeUserId));
+
+  useEffect(() => {
+    if (employeeContextEnabled) return;
+    if (!formData.employeeXID) return;
+    setFormData((prev) => ({ ...prev, employeeXID: '' }));
+  }, [employeeContextEnabled, formData.employeeXID]);
+
+
+  useEffect(() => {
+    if (manualClassification) return;
+    const timer = setTimeout(async () => {
+      const requestId = latestSuggestionRequestRef.current + 1;
+      latestSuggestionRequestRef.current = requestId;
+
+      if (!formData.title.trim() && !formData.description.trim()) {
+        if (requestId === latestSuggestionRequestRef.current) setSuggestion(null);
+        return;
+      }
+      try {
+        const response = await caseApi.suggestDocketCategory({ title: formData.title, description: formData.description });
+        if (requestId !== latestSuggestionRequestRef.current) return;
+        const top = response?.data?.suggestions?.[0] || null;
+        setSuggestion(top);
+      } catch (error) {
+        if (requestId === latestSuggestionRequestRef.current) setSuggestion(null);
+      }
+    }, 450);
+    return () => clearTimeout(timer);
+  }, [formData.title, formData.description, manualClassification]);
+
+  const applySuggestion = () => {
+    if (!suggestion || manualClassification) return;
+    const selectedCategory = categories.find((item) => item._id === suggestion.categoryId);
+    const isValidSubcategory = (selectedCategory?.subcategories || []).some((item) => item.isActive && item.id === suggestion.subcategoryId);
+    setFormData((prev) => ({
+      ...prev,
+      categoryId: suggestion.categoryId,
+      subcategoryId: isValidSubcategory ? suggestion.subcategoryId : '',
+    }));
+    setErrors((prev) => ({ ...prev, categoryId: '', subcategoryId: '' }));
+    setSuggestion(null);
+    setSubmitError('');
+  };
+
+  const validateStep = (stepIndex = step) => {
+    const nextErrors = {};
+    const payload = buildCreateDocketPayload(formData);
+
+    if (stepIndex === 0) {
+      if (!payload.title) nextErrors.title = 'Enter a title to continue.';
+      else if (payload.title.length < 5) nextErrors.title = 'Title should be at least 5 characters.';
+      if (!payload.isInternal && !payload.clientId) nextErrors.clientId = 'Select a client for client work.';
+    }
+
+    if (stepIndex === 1) {
+      if (!payload.categoryId) nextErrors.categoryId = 'Select a category to continue.';
+      if (!payload.subcategoryId) nextErrors.subcategoryId = 'Select a subcategory to continue.';
+    }
+
+    if (stepIndex === 2 && !payload.workbasketId) nextErrors.workbasketId = 'Workbasket mapping is required before submit.';
+    if (stepIndex === 3 && relatedEmployeeUserRequired && !payload.relatedEmployeeUserId) nextErrors.relatedEmployeeUserId = 'Related employee/user is required for this category.';
+
+    if (payload.categoryId && payload.subcategoryId) {
+      const isValidSub = subcategories.some((item) => item.id === payload.subcategoryId);
+      if (!isValidSub) nextErrors.subcategoryId = 'Selected subcategory is not valid for this category.';
+    }
+
+    setErrors((prev) => ({ ...prev, ...nextErrors }));
+    return Object.keys(nextErrors).length === 0;
+  };
+
+  const canProceed = useMemo(() => {
+    if (step === 0) return Boolean(formData.title.trim()) && (formData.workType === 'internal' || Boolean(formData.clientId));
+    if (step === 1) return Boolean(formData.categoryId) && Boolean(formData.subcategoryId);
+    if (step === 2) return Boolean(formData.workbasketId);
+    return true;
+  }, [formData.clientId, formData.title, formData.workbasketId, step]);
+  const isClientsBlocked = Boolean(dependencyErrors.clients) || !hasActiveClients;
+  const isCategoriesBlocked = Boolean(dependencyErrors.categories) || !hasActiveSubcategory;
+  const isWorkbasketsBlocked = Boolean(dependencyErrors.workbaskets) || workbaskets.length === 0;
+  const setupBlockingMessage = isClientsBlocked || isCategoriesBlocked || isWorkbasketsBlocked
+    ? 'Complete setup before creating your first docket.'
+    : '';
+  const canSubmitFromSetup = !isClientsBlocked && !isCategoriesBlocked && !isWorkbasketsBlocked;
+  const shouldShowSetupChecklist = !setupChecklistCollapsed || !canSubmitFromSetup || Object.keys(dependencyErrors).length > 0 || Boolean(clientLoadIssue);
+  const retryFailedDependencies = () => loadDeps();
+  const firmSlug = window.location.pathname.split('/')[3] || '';
+
+  const updateField = (name, value) => {
+    if (name === 'categoryId' || name === 'subcategoryId') setManualClassification(true);
+    setFormData((prev) => ({ ...prev, [name]: value }));
+    setErrors((prev) => ({ ...prev, [name]: '' }));
+    setSubmitError('');
+  };
+
+  const handleCancel = () => {
+    if (!confirmLeaveIfDirty()) return;
+    onCancel?.();
+  };
+
+  const handleCreate = async () => {
+    if (loading.submit) return;
+    setSubmitError('');
+    const submitPayload = { ...formData, idempotencyKey: formData.idempotencyKey || createSubmissionKey() };
+    const payload = buildCreateDocketPayload(submitPayload);
+    const payloadErrors = validateCreateDocketPayload(payload, { categories, subcategories });
+    if (!validateStep(0) || !validateStep(1) || !validateStep(2) || !validateStep(3) || Object.keys(payloadErrors).length > 0) {
+      setErrors((prev) => ({ ...prev, ...payloadErrors }));
+      return;
+    }
+
+    setLoading((prev) => ({ ...prev, submit: true }));
+    setStatusMessage('Creating docket…');
+    try {
+      const response = await caseApi.createDocket(payload);
+
+      if (response?.success) {
+        setFormData((prev) => ({ ...prev, idempotencyKey: createSubmissionKey() }));
+        onCreated?.(response);
+        return;
+      }
+
+      const apiMessage = response?.message || 'Failed to create docket. Please review the fields and try again.';
+      setSubmitError(apiMessage);
+      if (isEmailLikeError(apiMessage)) showError(apiMessage);
+    } catch (error) {
+      const apiMessage = error?.data?.message || error?.response?.data?.message || error?.message || 'Failed to create docket. Please review the fields and try again.';
+      const fieldErrors = error?.data?.fieldErrors || {};
+      const detailErrors = Array.isArray(error?.data?.error?.details) ? error.data.error.details : [];
+      const detailFieldErrors = detailErrors.reduce((acc, item) => {
+        if (item?.path && item?.message) {
+          const field = String(item.path).split('.').pop();
+          acc[field] = item.message;
+        }
+        return acc;
+      }, {});
+      const mergedErrors = { ...detailFieldErrors, ...fieldErrors };
+      if (Object.keys(mergedErrors).length > 0) {
+        setErrors((prev) => ({ ...prev, ...mergedErrors }));
+        const earliestStep = resolveEarliestErrorStep(mergedErrors, FIELD_TO_STEP);
+        if (earliestStep !== null) {
+          setStep(Math.min(step, earliestStep));
+        }
+      }
+      setSubmitError(apiMessage);
+      showError(apiMessage);
+    } finally {
+      setStatusMessage('');
+      setLoading((prev) => ({ ...prev, submit: false }));
+    }
+  };
+
+  return (
+    <Card>
+      <div className="create-case__header">
+        <h1>Create Docket</h1>
+        <p className="text-secondary">Step {step + 1} of {STEPS.length}: {STEPS[step]}</p>
+      </div>
+
+      <ol className="guided-docket-stepper" aria-label="Create docket progress">
+        {STEPS.map((label, index) => (
+          <li key={label}>
+            <span
+              className={`guided-docket-stepper__item ${index === step ? 'is-current' : ''} ${index < step ? 'is-complete' : 'is-pending'}`.trim()}
+              aria-current={index === step ? 'step' : undefined}
+            >
+              {index + 1}. {label}
+            </span>
+          </li>
+        ))}
+      </ol>
+
+      {submitError ? <p className="guided-docket-notice guided-docket-notice--error">{submitError}</p> : null}
+      {statusMessage ? <p className="guided-docket-notice guided-docket-notice--info">{statusMessage}</p> : null}
+      <div className="guided-docket-panel">
+        <div className="guided-docket-panel__header">
+          <p className="guided-docket-panel__title">Setup checklist</p>
+          <Button type="button" variant="outline" onClick={() => setSetupChecklistCollapsed((prev) => !prev)}>
+            {shouldShowSetupChecklist ? 'Hide checklist' : 'Show checklist'}
+          </Button>
+        </div>
+        {shouldShowSetupChecklist ? (
+          <ul className="guided-docket-list">
+          <li>Clients: {clientLoadIssue || dependencyErrors.clients ? (clientLoadIssue || dependencyErrors.clients) : (hasActiveClients ? 'Ready.' : 'Add a client first.')} <a href={ROUTES.CLIENTS(firmSlug)}>Open Clients</a></li>
+          <li>Categories: {dependencyErrors.categories ? dependencyErrors.categories : (hasActiveSubcategory ? 'Ready.' : 'Create a category and subcategory first.')} <a href={ROUTES.WORK_CATEGORY_MANAGEMENT(firmSlug)}>Open Category Management</a></li>
+          <li>Workbaskets: {dependencyErrors.workbaskets ? dependencyErrors.workbaskets : (workbaskets.length > 0 ? 'Ready.' : 'Create an active workbasket first.')} <a href={ROUTES.WORK_SETTINGS(firmSlug)}>Open Work Settings</a></li>
+          <li>Users: {dependencyErrors.users ? 'Users could not be loaded.' : (users.length > 0 ? 'Ready.' : 'Add or activate a team member first if assignment is required.')} <a href={ROUTES.ADMIN(firmSlug)}>Open Team/Admin</a></li>
+          </ul>
+        ) : null}
+        {setupBlockingMessage ? <p className="guided-docket-notice guided-docket-notice--warning">{setupBlockingMessage}</p> : null}
+        {(Object.keys(dependencyErrors).length > 0 || clientLoadIssue) ? <Button type="button" variant="outline" onClick={retryFailedDependencies}>Retry failed loading</Button> : null}
+      </div>
+      <div className="guided-docket-panel">
+        <p className="guided-docket-panel__title">First docket guidance</p>
+        <ul className="guided-docket-list">
+          <li>Client: {selectedClient ? `${selectedClient.clientId} - ${selectedClient.businessName || 'Unnamed client'}` : (defaultClient ? `${defaultClient.clientId} - ${defaultClient.businessName || 'Default firm client'}` : 'Will use your default firm client if available')}.</li>
+          <li>Category + subcategory determine routing and queue visibility.</li>
+          <li>Workbasket is required and auto-selected from category/subcategory mapping.</li>
+        </ul>
+      </div>
+      {!hasRoutingPrerequisites ? (
+        <p className="guided-docket-notice guided-docket-notice--warning">
+          Docket creation may be blocked until categories/subcategories and at least one active workbasket are configured in Work Settings.
+        </p>
+      ) : null}
+
+      {step === 0 && (
+        <>
+          <Input label="Title" required value={formData.title} onChange={(e) => updateField('title', e.target.value)} error={errors.title} helpText="Use a clear title your team can recognize quickly." />
+          <Select
+            label="Client (defaults to your firm for internal work)"
+            required
+            value={formData.clientId}
+            onChange={(e) => updateField('clientId', e.target.value)}
+            error={errors.clientId}
+            disabled={loading.clients}
+            helpText={hasActiveClients ? 'Select a client. Use your firm (default) for internal tasks.' : 'Add a client first.'}
+            options={[
+              { value: '', label: loading.clients ? 'Loading clients...' : (hasActiveClients ? 'Use default firm client (auto-filled on submit)' : 'No active clients available') },
+              ...clients.map((item) => ({ value: item.clientId, label: `${item.clientId} - ${item.businessName || 'Unnamed client'}` })),
+            ]}
+          />
+          {!loading.clients && !hasActiveClients ? <p className="mb-2 text-sm text-amber-700">Add a client first.</p> : null}
+          {clientLoadIssue ? <p className="mb-2 text-sm text-amber-700">{clientLoadIssue}</p> : null}
+          <Textarea label="Description (optional)" rows={4} value={formData.description} onChange={(e) => updateField('description', e.target.value)} helpText="Include enough context for the assignee and reviewer." />
+        </>
+      )}
+
+      {step === 1 && (
+        <>
+          {suggestion ? (
+            <div className="guided-docket-notice guided-docket-notice--info" role="status" aria-live="polite">
+              <p><strong>Suggested category:</strong> {suggestion.categoryName} / {suggestion.subcategoryName} ({suggestion.confidence})</p>
+              <div className="guided-docket-inline-actions">
+                <Button type="button" onClick={applySuggestion} disabled={manualClassification}>Apply suggestion</Button>
+                <Button type="button" variant="outline" onClick={() => setSuggestion(null)}>Dismiss</Button>
+              </div>
+            </div>
+          ) : null}
+          <Select
+            label="Category"
+            required
+            value={formData.categoryId}
+            onChange={(e) => updateField('categoryId', e.target.value)}
+            disabled={loading.categories}
+            error={errors.categoryId}
+            helpText="Category and subcategory decide routing defaults."
+            options={[{ value: '', label: 'Select category' }, ...categories.map((item) => ({ value: item._id, label: item.name }))]}
+          />
+          <Select
+            label="Subcategory"
+            required
+            value={formData.subcategoryId}
+            onChange={(e) => updateField('subcategoryId', e.target.value)}
+            disabled={!formData.categoryId || loading.categories}
+            error={errors.subcategoryId}
+            options={[{ value: '', label: 'Select subcategory' }, ...subcategories.map((item) => ({ value: item.id, label: item.name }))]}
+          />
+        </>
+      )}
+
+      {step === 2 && (
+        <>
+          <Input
+            label="Workbasket"
+            readOnly
+            value={(workbaskets.find((item) => item._id === formData.workbasketId)?.name) || (loading.workbaskets ? 'Loading workbasket...' : 'Auto-selected by category/subcategory')}
+            error={errors.workbasketId}
+            helpText="Workbasket is auto-mapped from category/subcategory settings."
+          />
+          <Select
+            label="Priority"
+            value={formData.priority}
+            onChange={(e) => updateField('priority', e.target.value)}
+            options={[{ value: 'low', label: 'Low' }, { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' }]}
+          />
+        </>
+      )}
+
+      {step === 3 && (
+        <>
+          <Select
+            label="Assign to user (optional)"
+            value={formData.assignedTo}
+            onChange={(e) => updateField('assignedTo', e.target.value)}
+            disabled={loading.users}
+            helpText="Leave empty to keep this docket in queue for assignment."
+            options={[{ value: '', label: loading.users ? 'Loading users...' : 'Keep unassigned in workbasket' }, ...activeUsers.map((item) => ({ value: item.xID, label: `${item.xID} - ${item.name || item.email || 'User'}` }))]}
+          />
+          <Select
+            label="Related employee/user"
+            required={relatedEmployeeUserRequired}
+            value={formData.relatedEmployeeUserId}
+            onChange={(e) => updateField('relatedEmployeeUserId', e.target.value)}
+            disabled={loading.users}
+            error={errors.relatedEmployeeUserId}
+            helpText={relatedEmployeeUserRequired
+              ? 'Required for this selected category/subcategory. This does not change who is assigned to work on the docket.'
+              : 'Use this when the docket concerns a specific employee or user, such as payroll, HR, onboarding, offboarding, reimbursement, or employee-specific compliance. This does not change who is assigned to work on the docket.'}
+            options={[
+              { value: '', label: loading.users ? 'Loading users...' : 'Not applicable' },
+              ...relatedEmployeeUsers.map((item) => ({
+                value: item._id || item.id,
+                label: `${item.name || item.fullName || item.displayName || item.email || item.xID || 'User'} — ${String(item.status || 'active').replace(/^./, (c) => c.toUpperCase())}`,
+              })),
+            ]}
+          />
+          {employeeContextEnabled ? (
+            <Select
+              label="Employee (subcategory context)"
+              value={formData.employeeXID}
+              onChange={(e) => updateField('employeeXID', e.target.value)}
+              disabled={loading.users}
+              helpText="This is a subcategory-specific employee context field and is separate from Related employee/user."
+              options={[{ value: '', label: loading.users ? 'Loading employees...' : 'Select employee, if applicable' }, ...activeUsers.map((item) => ({ value: item.xID, label: `${item.xID} - ${item.name || item.email || 'User'} - ${item.department || 'No Department'}` }))]}
+            />
+          ) : null}
+        </>
+      )}
+
+      {step === 4 && (
+        <div>
+          <h3>Review</h3>
+          <p><strong>Title:</strong> {formData.title || '—'}</p>
+          <p><strong>Description:</strong> {formData.description || '—'}</p>
+          <p><strong>Client:</strong> {((clients.find((item) => item.clientId === formData.clientId)?.businessName && `${formData.clientId} - ${clients.find((item) => item.clientId === formData.clientId)?.businessName}`) || formData.clientId || 'Default firm client (auto-selected)')}</p>
+          <p><strong>Category:</strong> {(categories.find((item) => item._id === formData.categoryId)?.name) || '—'}</p>
+          <p><strong>Subcategory:</strong> {(subcategories.find((item) => item.id === formData.subcategoryId)?.name) || '—'}</p>
+          <p><strong>Workbasket:</strong> {(workbaskets.find((item) => item._id === formData.workbasketId)?.name) || '—'}</p>
+          <p><strong>Priority:</strong> {formData.priority || 'medium'}</p>
+          <p><strong>Assignee:</strong> {formData.assignedTo || 'Unassigned (workbasket queue)'}</p>
+          {formData.relatedEmployeeUserId ? <p><strong>Related employee/user:</strong> {selectedRelatedEmployeeUser ? `${selectedRelatedEmployeeUser.name || selectedRelatedEmployeeUser.fullName || selectedRelatedEmployeeUser.displayName || selectedRelatedEmployeeUser.email || selectedRelatedEmployeeUser.xID || 'User'} · ${selectedRelatedEmployeeUser.xID || 'No xID'} · ${selectedRelatedEmployeeUser.status || 'active'}` : 'Selected user'}</p> : null}
+          {formData.employeeXID ? <p><strong>Employee:</strong> {selectedEmployee ? `${selectedEmployee.xID} - ${selectedEmployee.name || selectedEmployee.email || 'User'}` : formData.employeeXID}</p> : null}
+        </div>
+      )}
+
+      <div className="create-case__actions guided-docket-actions">
+        <Button type="button" variant="outline" onClick={handleCancel} disabled={loading.submit}>Cancel</Button>
+        <Button type="button" variant="outline" onClick={() => setStep((prev) => Math.max(0, prev - 1))} disabled={step === 0 || loading.submit}>Back</Button>
+        {step < STEPS.length - 1 ? (
+          <Button type="button" variant="primary" onClick={() => validateStep() && setStep((prev) => Math.min(STEPS.length - 1, prev + 1))} disabled={!canProceed || loading.submit || !canSubmitFromSetup}>Next</Button>
+        ) : (
+          <Button type="button" variant="primary" onClick={handleCreate} disabled={loading.submit || !canSubmitFromSetup}>{loading.submit ? 'Creating…' : 'Create Docket'}</Button>
+        )}
+      </div>
+    </Card>
+  );
+};
+
+export default GuidedDocketForm;

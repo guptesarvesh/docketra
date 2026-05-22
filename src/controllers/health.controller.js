@@ -1,0 +1,153 @@
+const mongoose = require('mongoose');
+const Firm = require('../models/Firm.model');
+const User = require('../models/User.model');
+const { validateEnv } = require('../config/validateEnv');
+const { getRedisClient } = require('../config/redis');
+const { getBuildMetadata } = require('../services/buildInfo.service');
+const { STATES, markDegraded, getState, setState } = require('../services/systemState.service');
+const { isFirmCreationDisabled, areFileUploadsDisabled } = require('../services/featureGate.service');
+const { getWorkerStatuses } = require('../services/workerRegistry.service');
+
+const DB_LATENCY_THRESHOLD_MS = Number(process.env.DB_LATENCY_THRESHOLD_MS || 750);
+const isRedisConfigured = () => Boolean(String(process.env.REDIS_URL || '').trim());
+
+const liveness = (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+};
+
+const runReadinessChecks = async () => {
+  const build = getBuildMetadata();
+  const checks = {
+    env: 'ok',
+    db: 'unknown',
+    dbLatencyMs: null,
+    redis: 'unknown',
+    featureFlags: {},
+    rateLimit: {
+      enabled: isRedisConfigured(),
+      redis: 'unknown',
+    },
+  };
+
+  const envResult = validateEnv({ exitOnError: false });
+  if (!envResult.valid) {
+    checks.env = 'failed';
+    markDegraded('env_invalid', { errors: envResult.errors });
+  }
+
+  if (mongoose.connection.readyState !== 1) {
+    checks.db = 'disconnected';
+    markDegraded('db_disconnected');
+  } else {
+    try {
+      const start = Date.now();
+      await mongoose.connection.db.admin().ping();
+      const latency = Date.now() - start;
+      checks.dbLatencyMs = latency;
+      if (latency > DB_LATENCY_THRESHOLD_MS) {
+        checks.db = 'degraded';
+        markDegraded('db_slow', { latencyMs: latency });
+      } else {
+        checks.db = 'ok';
+      }
+      await Promise.all([
+        Firm.estimatedDocumentCount().catch(() => 0),
+        User.estimatedDocumentCount().catch(() => 0),
+      ]);
+    } catch (error) {
+      checks.db = 'error';
+      markDegraded('db_error', { message: error.message });
+    }
+  }
+
+  try {
+    const redisClient = getRedisClient();
+    if (!redisClient) {
+      checks.redis = 'not_configured';
+      checks.rateLimit.redis = 'not_configured';
+    } else {
+      checks.redis = redisClient.status || 'unknown';
+      checks.rateLimit.redis = redisClient.status || 'unknown';
+      if (redisClient.status !== 'ready') {
+        markDegraded('redis_unhealthy', { status: redisClient.status });
+      }
+    }
+  } catch (error) {
+    checks.redis = 'error';
+    checks.rateLimit.redis = 'error';
+    markDegraded('redis_config_invalid', { message: error.message });
+  }
+
+  const featureFlags = {
+    firmCreation: isFirmCreationDisabled() ? 'disabled' : 'enabled',
+    fileUploads: areFileUploadsDisabled() ? 'disabled' : 'enabled',
+  };
+  checks.featureFlags = featureFlags;
+
+  const systemState = getState();
+  const redisStatusOk = ['ready', 'ok', 'degraded', 'not_configured', 'unknown'].includes(checks.redis);
+  const dbStatusOk = checks.db === 'ok';
+  const ready = checks.env === 'ok' && redisStatusOk && dbStatusOk;
+  if (ready) {
+    setState(STATES.NORMAL);
+  }
+  return {
+    ready,
+    build,
+    checks,
+    systemState: getState(),
+    uptimeSeconds: Math.round(process.uptime()),
+  };
+};
+
+const readiness = async (req, res) => {
+  const result = await runReadinessChecks();
+  const isReady = result.ready && result.systemState.state === STATES.NORMAL;
+  const status = isReady ? 'ready' : (result.systemState.state === STATES.DEGRADED ? 'degraded' : 'not_ready');
+  const payload = {
+    status,
+    version: result.build.version,
+    commit: result.build.commit,
+    buildTimestamp: result.build.buildTimestamp,
+    uptimeSeconds: result.uptimeSeconds,
+    checks: result.checks,
+    systemState: result.systemState,
+    timestamp: new Date().toISOString(),
+  };
+  if (!isReady) {
+    return res.status(503).json(payload);
+  }
+  return res.json(payload);
+};
+
+const apiHealth = async (_req, res) => {
+  const mongo = mongoose.connection.readyState === 1 ? 'connected' : 'disconnected';
+  let redis = 'disconnected';
+  try {
+    const redisClient = getRedisClient();
+    if (!redisClient) redis = 'not_configured';
+    else redis = redisClient.status === 'ready' ? 'connected' : 'disconnected';
+  } catch (_error) {
+    redis = 'disconnected';
+  }
+
+  const statuses = getWorkerStatuses();
+  const requiredWorkers = ['storage', 'email', 'audit'];
+  const workersRunning = requiredWorkers.every((name) => statuses?.[name]?.status === 'running');
+  const workers = workersRunning ? 'running' : 'degraded';
+
+  const healthy = mongo === 'connected' && redis === 'connected' && workersRunning;
+  return res.json({
+    status: healthy ? 'healthy' : 'degraded',
+    mongo,
+    redis,
+    workers,
+  });
+};
+
+module.exports = {
+  liveness,
+  readiness,
+  apiHealth,
+  runReadinessChecks,
+};

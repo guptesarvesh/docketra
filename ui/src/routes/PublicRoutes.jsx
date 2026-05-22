@@ -1,0 +1,93 @@
+import React from 'react';
+import { Route, Navigate, useLocation, useParams } from 'react-router-dom';
+import { MarketingLayout } from '../components/routing/MarketingLayout';
+import { DefaultRoute } from '../components/routing/DefaultRoute';
+import {
+  ChangePasswordPage,
+  CompleteProfile,
+  FirmLoginPage,
+  ForgotPasswordPage,
+  LoginPage,
+  FindWorkspacePage,
+  MarketingAboutPage,
+  MarketingContactPage,
+  MarketingFeaturesPage,
+  MarketingHomePage,
+  MarketingPrivacyPage,
+  MarketingSecurityPage,
+  MarketingAcceptableUsePage,
+  MarketingSignupPage,
+  MarketingTermsPage,
+  OtpVerificationPage,
+  ResetPasswordPage,
+  SetPasswordPage,
+  UploadPage,
+  PublicFormPage,
+} from './lazyPages';
+import { RouteSuspenseOutlet } from './RouteSuspenseOutlet';
+
+const AppFirmRootRedirect = () => {
+  const { firmSlug } = useParams();
+  return <Navigate to={`/${firmSlug}/login`} replace />;
+};
+
+const AppFirmLoginRedirect = () => {
+  const { firmSlug } = useParams();
+  return <Navigate to={`/${firmSlug}/login`} replace />;
+};
+
+const LegacyFirmForgotRedirect = () => {
+  const { firmSlug } = useParams();
+  return <Navigate to={`/${firmSlug}/forgot-password`} replace />;
+};
+
+const LegacySuperadminRedirect = () => {
+  const location = useLocation();
+  const suffix = location.pathname.replace('/superadmin', '');
+  const target = `/app/superadmin${suffix}${location.search || ''}`;
+  return <Navigate to={target} replace />;
+};
+
+export const PublicRoutes = () => (
+  <>
+    <Route element={<RouteSuspenseOutlet />}>
+      <Route path="/" element={<MarketingHomePage />} />
+    </Route>
+
+    <Route element={<MarketingLayout />}>
+      <Route element={<RouteSuspenseOutlet />}>
+        <Route path="/features" element={<MarketingFeaturesPage />} />
+        <Route path="/terms" element={<MarketingTermsPage />} />
+        <Route path="/privacy" element={<MarketingPrivacyPage />} />
+        <Route path="/security" element={<MarketingSecurityPage />} />
+        <Route path="/acceptable-use" element={<MarketingAcceptableUsePage />} />
+        <Route path="/about" element={<MarketingAboutPage />} />
+        <Route path="/contact" element={<MarketingContactPage />} />
+        <Route path="/login" element={<Navigate to="/find-workspace" replace />} />
+        <Route path="/superadmin" element={<LoginPage />} />
+        <Route path="/find-workspace" element={<FindWorkspacePage />} />
+        <Route path="/superadmin/login" element={<LoginPage />} />
+      </Route>
+    </Route>
+
+    <Route element={<RouteSuspenseOutlet />}>
+      <Route path="/signup" element={<MarketingSignupPage />} />
+      <Route path="/:firmSlug/login" element={<FirmLoginPage />} />
+      <Route path="/app/:firmSlug" element={<AppFirmRootRedirect />} />
+      <Route path="/app/:firmSlug/login" element={<AppFirmLoginRedirect />} />
+      <Route path="/:firmSlug/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/app/:firmSlug/forgot-password" element={<LegacyFirmForgotRedirect />} />
+      <Route path="/forgot-password" element={<ForgotPasswordPage />} />
+      <Route path="/reset-password" element={<ResetPasswordPage />} />
+      <Route path="/change-password" element={<ChangePasswordPage />} />
+      <Route path="/complete-profile" element={<CompleteProfile />} />
+      <Route path="/onboarding" element={<CompleteProfile />} />
+      <Route path="/dashboard" element={<DefaultRoute />} />
+      <Route path="/auth/setup-account" element={<SetPasswordPage />} />
+      <Route path="/setup-password" element={<SetPasswordPage />} />
+      <Route path="/superadmin/*" element={<LegacySuperadminRedirect />} />
+      <Route path="/upload/:token" element={<UploadPage />} />
+      <Route path="/forms/:formId" element={<PublicFormPage />} />
+    </Route>
+  </>
+);

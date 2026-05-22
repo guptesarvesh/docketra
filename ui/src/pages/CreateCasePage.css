@@ -1,0 +1,211 @@
+/**
+ * Create Case Page Styles
+ */
+
+.create-case {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.25rem 1.5rem;
+}
+
+.create-case__header {
+  margin-bottom: var(--spacing-xl);
+}
+
+.create-case__header h1 {
+  color: var(--text-primary);
+  font-size: var(--font-size-2xl);
+  margin-bottom: var(--spacing-sm);
+}
+
+/* Two-column layout: form + summary panel */
+.create-case__layout {
+  display: flex;
+  gap: 1.5rem;
+  align-items: flex-start;
+}
+
+.create-case__form-area {
+  flex: 1 1 0;
+  max-width: 780px;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+/* Section cards within the form */
+.create-case__section {
+  margin: 0;
+}
+
+.create-case__section-heading {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.create-case__section-done {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #059669;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* Right-side sticky summary panel (desktop) */
+.create-case__summary {
+  display: none;
+}
+
+@media (min-width: 1024px) {
+  .create-case__summary {
+    display: block;
+    width: 260px;
+    flex-shrink: 0;
+    position: sticky;
+    top: 80px;
+    align-self: flex-start;
+  }
+}
+
+.create-case__summary-inner {
+  background: var(--layout-surface, #fff);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md, 8px);
+  padding: 1.25rem;
+  box-shadow: var(--shadow-xs);
+}
+
+.create-case__summary-title {
+  margin: 0 0 1rem;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-body);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.create-case__summary-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: 12px;
+}
+
+.create-case__summary-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.create-case__summary-value {
+  font-size: 13px;
+  color: var(--text-body);
+  word-break: break-word;
+}
+
+.create-case__summary-empty {
+  font-style: italic;
+  color: var(--text-muted);
+}
+
+.create-case__summary-status {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--color-border);
+}
+
+.create-case__summary-validity {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.create-case__summary-validity--ok {
+  color: #059669;
+  font-weight: 600;
+}
+
+/* Footer actions bar */
+.create-case__actions {
+  display: flex;
+  gap: var(--spacing-md);
+  justify-content: space-between;
+  align-items: center;
+  margin-top: var(--spacing-lg);
+  border-top: 1px solid var(--color-border);
+  padding-top: var(--spacing-md);
+  background: #fff;
+}
+
+.create-case__actions-right {
+  display: flex;
+  gap: var(--spacing-md);
+}
+
+.create-case__status {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.create-case__duplicate-warning {
+  padding: var(--spacing-lg);
+}
+
+.create-case__matched-fields {
+  background: var(--color-bg-app);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--color-border);
+  margin-top: var(--spacing-md);
+  padding: var(--spacing-md);
+}
+
+.create-case__matched-fields ul {
+  list-style: disc;
+  margin-left: var(--spacing-lg);
+  margin-top: var(--spacing-sm);
+}
+
+.create-case__duplicate-actions {
+  display: flex;
+  gap: var(--spacing-md);
+  justify-content: flex-end;
+  margin-top: var(--spacing-lg);
+}
+
+@media (min-width: 1024px) {
+  .create-case__actions {
+    position: sticky;
+    bottom: 0;
+    padding-bottom: var(--spacing-md);
+  }
+}
+
+@media (max-width: 1023px) {
+  .create-case__form-area {
+    max-width: 100%;
+  }
+}
+
+
+/* Task 7: Draft auto-save indicator */
+.create-case__draft-saved {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: #15803d;
+  background: #f0fdf4;
+  border: 1px solid #bbf7d0;
+  border-radius: 6px;
+  padding: 4px 10px;
+  margin-top: 8px;
+}

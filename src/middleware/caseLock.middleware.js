@@ -1,0 +1,172 @@
+const Case = require('../models/Case.model');
+const { CaseRepository } = require('../repositories');
+const { CASE_LOCK_CONFIG } = require('../config/constants');
+const log = require('../utils/log');
+
+const maskEmail = (email) => {
+  if (!email || typeof email !== 'string') return null;
+  const [user, domain] = email.split('@');
+  if (!domain) return '***';
+  return `***@${domain}`;
+};
+
+/**
+ * Case Lock Middleware
+ * 
+ * Provides concurrency control to prevent multiple users from 
+ * modifying the same case simultaneously.
+ * 
+ * Usage:
+ * - Apply this middleware to routes that modify case data
+ * - Pass userEmail in request body or from authentication
+ */
+
+/**
+ * Check if a case is locked by another user
+ * Returns 409 Conflict if case is locked by someone else
+ * Auto-unlocks if inactive for more than 2 hours
+ */
+const checkCaseLock = async (req, res, next) => {
+  try {
+    const { caseId } = req.params;
+    const userEmail = req.body.performedBy || req.body.createdBy || req.body.clonedBy;
+    
+    if (!userEmail) {
+      return res.status(400).json({
+        success: false,
+        message: 'User email is required for case operations',
+      });
+    }
+    
+    // Find case by caseId (not MongoDB _id) - with firm scoping
+    const caseData = await CaseRepository.findByCaseId(req.user.firmId, caseId, req.user.role);
+    
+    if (!caseData) {
+      return res.status(404).json({
+        success: false,
+        message: 'Case not found',
+      });
+    }
+    
+    // Check if case is locked by another user
+    if (caseData.lockStatus.isLocked && 
+        caseData.lockStatus.activeUserEmail && 
+        caseData.lockStatus.activeUserEmail !== userEmail.toLowerCase()) {
+      
+      // Check for inactivity auto-unlock (2 hours)
+      const inactivityTimeout = CASE_LOCK_CONFIG.INACTIVITY_TIMEOUT_MS;
+      const lastActivity = caseData.lockStatus.lastActivityAt || caseData.lockStatus.lockedAt;
+      const now = new Date();
+      
+      if (lastActivity && (now - lastActivity) > inactivityTimeout) {
+        // Auto-unlock due to inactivity
+        log.info(`Auto-unlocking case ${caseId} due to ${CASE_LOCK_CONFIG.INACTIVITY_TIMEOUT_HOURS}-hour inactivity`);
+        
+        const CaseHistory = require('../models/CaseHistory.model');
+        
+        // Log the auto-unlock in history
+        await CaseHistory.create({
+          caseId,
+          actionType: 'AutoUnlocked',
+          description: `Case auto-unlocked due to 2 hours of inactivity. Previous lock holder: ${caseData.lockStatus.activeUserEmail}`,
+          performedBy: 'system',
+        });
+        
+        // Unlock the case
+        caseData.lockStatus = {
+          isLocked: false,
+          activeUserEmail: null,
+          lockedAt: null,
+          lastActivityAt: null,
+        };
+        await caseData.save();
+        
+        // Continue with the request
+      } else {
+        // Still within 2-hour window, deny access
+        return res.status(409).json({
+          success: false,
+          code: 'CASE_LOCKED',
+          message: 'This case is currently locked by another user.',
+          lockedBy: maskEmail(caseData.lockStatus.activeUserEmail),
+          lockedAt: caseData.lockStatus.lockedAt,
+          lastActivityAt: lastActivity,
+          action: 'retry',
+        });
+      }
+    }
+    
+    // Store case data for use in controller
+    req.caseData = caseData;
+    req.userEmail = userEmail.toLowerCase();
+    
+    next();
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Error checking case lock status',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Lock a case for the current user
+ * @param {string} firmId - Firm ID from authenticated user
+ * @param {string} caseId - Case identifier
+ * @param {string} userEmail - User email
+ * @param {string} role - Caller's role (required)
+ */
+const lockCase = async (firmId, caseId, userEmail, role) => {
+  try {
+    const caseData = await CaseRepository.findByCaseId(firmId, caseId, role);
+    
+    if (!caseData) {
+      throw new Error('Case not found');
+    }
+    
+    caseData.lockStatus = {
+      isLocked: true,
+      activeUserEmail: userEmail.toLowerCase(),
+      lockedAt: new Date(),
+    };
+    
+    await caseData.save();
+    return caseData;
+  } catch (error) {
+    throw error;
+  }
+};
+
+/**
+ * Unlock a case
+ * @param {string} firmId - Firm ID from authenticated user
+ * @param {string} caseId - Case identifier
+ * @param {string} role - Caller's role (required)
+ */
+const unlockCase = async (firmId, caseId, role) => {
+  try {
+    const caseData = await CaseRepository.findByCaseId(firmId, caseId, role);
+    
+    if (!caseData) {
+      throw new Error('Case not found');
+    }
+    
+    caseData.lockStatus = {
+      isLocked: false,
+      activeUserEmail: null,
+      lockedAt: null,
+    };
+    
+    await caseData.save();
+    return caseData;
+  } catch (error) {
+    throw error;
+  }
+};
+
+module.exports = {
+  checkCaseLock,
+  lockCase,
+  unlockCase,
+};

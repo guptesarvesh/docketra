@@ -1,0 +1,948 @@
+const mongoose = require('mongoose');
+const Case = require('../models/Case.model');
+const Client = require('../models/Client.model');
+const Comment = require('../models/Comment.model');
+const Attachment = require('../models/Attachment.model');
+const User = require('../models/User.model');
+const Team = require('../models/Team.model');
+const { enforceTenantScope } = require('../utils/tenantScope');
+const CaseStatus = require('../domain/case/caseStatus');
+const { logCaseListViewed } = require('../services/auditLog.service');
+const caseActionService = require('../services/caseAction.service');
+const { canViewUserWorklist } = require('../services/worklistAccess.service');
+const log = require('../utils/log');
+const { logSlowEndpoint } = require('../utils/slowLog');
+const SLOW_WORKLIST_QUERY_MS = 400;
+const ERROR_CODES = {
+  GLOBAL_SEARCH_FAILED: 'GLOBAL_SEARCH_FAILED',
+  CATEGORY_WORKLIST_FETCH_FAILED: 'CATEGORY_WORKLIST_FETCH_FAILED',
+  EMPLOYEE_WORKLIST_FETCH_FAILED: 'EMPLOYEE_WORKLIST_FETCH_FAILED',
+  GLOBAL_WORKLIST_FETCH_FAILED: 'GLOBAL_WORKLIST_FETCH_FAILED',
+};
+
+const handleControllerError = ({ req, res, error, logEvent, code, message, context = {} }) => {
+  log.error(logEvent, {
+    req,
+    error,
+    code,
+    ...context,
+  });
+
+  return res.status(500).json({
+    success: false,
+    message,
+    code,
+  });
+};
+
+const toObjectIdStringOrNull = (value) => {
+  if (!value) {
+    return null;
+  }
+
+  const normalizedValue = String(value).trim();
+  if (!normalizedValue || !mongoose.isValidObjectId(normalizedValue)) {
+    return null;
+  }
+
+  return normalizedValue;
+};
+
+const logSlowWorklistQuery = ({ req = null, queryName, durationMs, firmId, userXID, page, limit }) => {
+  logSlowEndpoint({
+    marker: '[WORKLIST_QUERY_SLOW]',
+    thresholdMs: SLOW_WORKLIST_QUERY_MS,
+    durationMs,
+    req,
+    firmId,
+    userXID,
+    queryCategoryFlags: { queryName },
+    pagination: { page, limit },
+  });
+};
+
+/**
+ * Search Controller for Global Search and Worklists
+ * PART A - READ-ONLY operations for finding cases and viewing worklists
+ * 
+ * PR: Hard Cutover to xID - Removed User model import (no longer needed),
+ * added CaseStatus import for canonical status constants
+ * PR: Fix Pended Case Visibility - Added caseActionService import for auto-reopen
+ */
+
+/**
+ * Global Search
+ * GET /api/search?q=term
+ * 
+ * Search across all cases accessible to the user
+ * Search fields: caseId, clientId, clientName, category, comment text, attachment fileName
+ * 
+ * Visibility Rules:
+ * - Admin: Can see ALL cases
+ * - Employee: Can see only cases where:
+ *   - They are assigned (assignedToXID matches their xID), OR
+ *   - The case category is in their allowedCategories
+ * 
+ * PR #42: Updated to use xID for assignment matching
+ * PR: Hard Cutover to xID - Removed email parameter, use req.user only
+ */
+const globalSearch = async (req, res) => {
+  try {
+    const { q } = req.query;
+    
+    // Get authenticated user from req.user (set by auth middleware)
+    const user = req.user;
+    const firmId = req.user?.firmId;
+    
+    if (!user || !user.xID) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required - user identity not found',
+      });
+    }
+
+    if (!firmId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firm context is required for search',
+      });
+    }
+    
+    if (!q || q.trim() === '') {
+      return res.status(400).json({
+        success: false,
+        message: 'Search query parameter "q" is required',
+      });
+    }
+    
+    const searchTerm = q.trim();
+    const isAdmin = user.role === 'Admin';
+    
+    // Escape special regex characters to prevent ReDoS (Regular Expression Denial of Service)
+    const escapedSearchTerm = searchTerm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+    // Build search query
+    let caseQuery = {};
+    
+    // Search in case fields (caseId, clientName, category)
+    const caseSearchConditions = [
+      { caseId: { $regex: escapedSearchTerm, $options: 'i' } },
+      { clientName: { $regex: escapedSearchTerm, $options: 'i' } },
+      { category: { $regex: escapedSearchTerm, $options: 'i' } },
+    ];
+    
+    // Include clientId if it exists on the model
+    if (searchTerm) {
+      caseSearchConditions.push({ clientId: { $regex: escapedSearchTerm, $options: 'i' } });
+    }
+    
+    // Find cases matching direct fields
+    if (isAdmin) {
+      caseQuery = { $or: caseSearchConditions };
+    } else {
+      // Employee: Only see assigned or allowed category cases
+      // PR #42: Use xID for assignment matching
+      // PR: xID Canonicalization - Use assignedToXID field
+      caseQuery = {
+        $and: [
+          { $or: caseSearchConditions },
+          {
+            $or: [
+              { assignedToXID: user.xID }, // CANONICAL: Match by xID in assignedToXID field
+              { category: { $in: user.allowedCategories } },
+            ],
+          },
+        ],
+      };
+    }
+    
+    const casesFromDirectSearch = await Case.find(enforceTenantScope(caseQuery, req, { source: 'search.global.direct' }))
+      .select('caseId title status category clientId clientName createdAt createdBy')
+      .lean();
+    
+    // Search in comments using text index
+    let commentsWithMatches = [];
+    try {
+      commentsWithMatches = await Comment.find(
+        enforceTenantScope({ $text: { $search: searchTerm } }, req, { source: 'search.comments.text' }),
+        { score: { $meta: 'textScore' } }
+      )
+        .select('caseId')
+        .lean();
+    } catch (error) {
+      // Text index might not be ready yet, fallback to regex
+      commentsWithMatches = await Comment.find(
+        enforceTenantScope({ text: { $regex: escapedSearchTerm, $options: 'i' } }, req, { source: 'search.comments.regex' })
+      )
+        .select('caseId')
+        .lean();
+    }
+    
+    // Search in attachments using text index
+    let attachmentsWithMatches = [];
+    try {
+      attachmentsWithMatches = await Attachment.find(
+        enforceTenantScope({ $text: { $search: searchTerm } }, req, { source: 'search.attachments.text' }),
+        { score: { $meta: 'textScore' } }
+      )
+        .select('caseId')
+        .lean();
+    } catch (error) {
+      // Text index might not be ready yet, fallback to regex
+      attachmentsWithMatches = await Attachment.find(
+        enforceTenantScope({ fileName: { $regex: escapedSearchTerm, $options: 'i' } }, req, { source: 'search.attachments.regex' })
+      )
+        .select('caseId')
+        .lean();
+    }
+    
+    // Collect unique caseIds from comments and attachments
+    const caseIdsFromComments = [...new Set(commentsWithMatches.map(c => c.caseId))];
+    const caseIdsFromAttachments = [...new Set(attachmentsWithMatches.map(a => a.caseId))];
+    const caseIdsFromRelated = [...new Set([...caseIdsFromComments, ...caseIdsFromAttachments])];
+    
+    // Find cases by these caseIds with visibility rules
+    let casesFromRelated = [];
+    if (caseIdsFromRelated.length > 0) {
+      let relatedQuery = { caseId: { $in: caseIdsFromRelated } };
+      
+      if (!isAdmin) {
+        // Apply employee visibility rules
+        // PR #42: Use xID for assignment matching
+        // PR: xID Canonicalization - Use assignedToXID field
+        relatedQuery = {
+            $and: [
+              { caseId: { $in: caseIdsFromRelated } },
+            {
+              $or: [
+                { assignedToXID: user.xID }, // CANONICAL: Match by xID in assignedToXID field
+                { category: { $in: user.allowedCategories } },
+              ],
+            },
+          ],
+        };
+      }
+      
+      casesFromRelated = await Case.find(enforceTenantScope(relatedQuery, req, { source: 'search.global.related' }))
+        .select('caseId title status category clientId clientName createdAt createdBy')
+        .lean();
+    }
+    
+    // Merge results and remove duplicates
+    const allCases = [...casesFromDirectSearch, ...casesFromRelated];
+    const uniqueCases = [];
+    const seenCaseIds = new Set();
+    
+    for (const c of allCases) {
+      if (!seenCaseIds.has(c.caseId)) {
+        seenCaseIds.add(c.caseId);
+        uniqueCases.push(c);
+      }
+    }
+    
+    // Sort by createdAt descending
+    uniqueCases.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+    
+    // Log case list view for audit
+    await logCaseListViewed({
+      viewerXID: user.xID,
+      filters: { searchQuery: searchTerm },
+      listType: 'GLOBAL_SEARCH',
+      resultCount: uniqueCases.length,
+      req,
+    });
+    
+    res.json({
+      success: true,
+      data: uniqueCases.map(c => ({
+        caseId: c.caseId,
+        title: c.title,
+        status: c.status,
+        category: c.category,
+        clientId: c.clientId || null,
+        clientName: c.clientName,
+        createdAt: c.createdAt,
+        createdBy: c.createdBy,
+      })),
+    });
+  } catch (error) {
+    return handleControllerError({
+      req,
+      res,
+      error,
+      logEvent: 'GLOBAL_SEARCH_FAILED',
+      code: ERROR_CODES.GLOBAL_SEARCH_FAILED,
+      message: 'Error performing search',
+      context: {
+        query: req.query || null,
+        userXID: req.user?.xID || null,
+        firmId: req.user?.firmId || null,
+      },
+    });
+  }
+};
+
+/**
+ * Category Worklist
+ * GET /api/worklists/category/:categoryId
+ * 
+ * Shows all cases in a specific category
+ * Excludes Pending cases
+ * Apply visibility rules (Admin sees all, Employee sees only allowed categories)
+ * 
+ * PR: Hard Cutover to xID - Removed email parameter, use req.user only
+ */
+const categoryWorklist = async (req, res) => {
+  try {
+    const { categoryId } = req.params;
+    
+    // Get authenticated user from req.user (set by auth middleware)
+    const user = req.user;
+    const firmId = req.user?.firmId || null;
+    
+    if (!user || !user.xID) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required - user identity not found',
+      });
+    }
+    
+    if (!categoryId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Category ID is required',
+      });
+    }
+
+    if (!firmId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firm context is required',
+      });
+    }
+    
+    const isAdmin = user.role === 'Admin';
+    
+    // Check if employee has access to this category
+    if (!isAdmin && !user.allowedCategories.includes(categoryId)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied: You do not have permission to view this category',
+      });
+    }
+    
+    // Build query: category matches and status is NOT Pending
+    const query = {
+      category: categoryId,
+      status: { $ne: 'Pending' },
+    };
+    
+    const cases = await Case.find(enforceTenantScope(query, req, { source: 'search.categoryWorklist' }))
+      .select('caseId createdAt createdBy status clientId clientName')
+      .sort({ createdAt: -1 })
+      .lean();
+    
+    // Log case list view for audit
+    await logCaseListViewed({
+      viewerXID: user.xID,
+      filters: { category: categoryId },
+      listType: 'CATEGORY_WORKLIST',
+      resultCount: cases.length,
+      req,
+    });
+    
+    res.json({
+      success: true,
+      data: (cases || []).map(c => ({
+        caseId: c.caseId,
+        createdAt: c.createdAt,
+        createdBy: c.createdBy,
+        status: c.status,
+        clientId: c.clientId || null,
+        clientName: c.clientName,
+      })),
+    });
+  } catch (error) {
+    return handleControllerError({
+      req,
+      res,
+      error,
+      logEvent: 'CATEGORY_WORKLIST_FETCH_FAILED',
+      code: ERROR_CODES.CATEGORY_WORKLIST_FETCH_FAILED,
+      message: 'Error fetching category worklist',
+      context: {
+        categoryId: req.params?.categoryId || null,
+        userXID: req.user?.xID || null,
+        firmId: req.user?.firmId || null,
+      },
+    });
+  }
+};
+
+/**
+ * Employee Worklist
+ * GET /api/worklists/employee/me
+ * 
+ * Shows all ASSIGNED/IN_PROGRESS cases assigned to the current user.
+ * This is the CANONICAL "My Worklist" query.
+ * 
+ * Query: assignedToXID = user.xID AND status IN (ASSIGNED, IN_PROGRESS)
+ * 
+ * Cases shown:
+ * - Assigned to this user's xID
+ * - Status is ASSIGNED or IN_PROGRESS
+ * 
+ * Cases NOT shown:
+ * - PENDING cases (these appear only in "My Pending Cases" dashboard)
+ * - FILED cases (these are hidden from employees)
+ * - unassigned OPEN cases (these are in global worklist)
+ * 
+ * Before returning results, auto-reopens any cases where pendingUntil has elapsed.
+ * 
+ * Dashboard "My Open Cases" count MUST use the exact same query.
+ * 
+ * PR #42: Updated to query by xID instead of email
+ * PR: Case Lifecycle - Fixed to use status = OPEN (not != Pending)
+ * PR: Hard Cutover to xID - Removed email parameter, use req.user only
+ * PR: Fix Pended Case Visibility - Added auto-reopen before querying
+ */
+const employeeWorklist = async (req, res) => {
+  try {
+    const startedAt = Date.now();
+    const requestedPage = Number.parseInt(req.query?.page, 10);
+    const requestedLimit = Number.parseInt(req.query?.limit, 10);
+    const normalizedPage = Number.isFinite(requestedPage) ? Math.max(requestedPage, 1) : 1;
+    const normalizedLimit = Number.isFinite(requestedLimit)
+      ? Math.min(Math.max(requestedLimit, 1), 100)
+      : 25;
+    const requestedStatuses = Array.isArray(req.query?.status)
+      ? req.query.status.flatMap((value) => String(value).split(','))
+      : (typeof req.query?.status === 'string' ? req.query.status.split(',') : []);
+    const normalizedRequestedStatuses = requestedStatuses
+      .map((value) => String(value || '').trim().toUpperCase())
+      .filter(Boolean);
+
+    // Get authenticated user from req.user (set by auth middleware)
+    const user = req.user;
+    const firmId = req.user?.firmId || null;
+    
+    if (!user || !user.xID) {
+      return res.status(401).json({
+        success: false,
+        message: 'Authentication required - user identity not found',
+      });
+    }
+    
+    if (!firmId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firm context is required',
+      });
+    }
+    
+    const requestedAssignee = String(req.query?.assigneeXID || '').trim();
+    const search = String(req.query?.search || '').trim();
+    const categoryFilter = String(req.query?.category || '').trim();
+    const subcategoryFilter = String(req.query?.subcategory || '').trim();
+    const sortBy = String(req.query?.sortBy || 'createdAt').trim();
+    const sortOrder = String(req.query?.sortOrder || 'desc').toLowerCase() === 'asc' ? 1 : -1;
+    const targetAssigneeXID = requestedAssignee || String(user.xID || '').trim();
+
+    if (!targetAssigneeXID) {
+      return res.status(400).json({
+        success: false,
+        message: 'Assignee xID is required',
+      });
+    }
+
+    const targetUser = await User.findOne({
+      xID: targetAssigneeXID,
+      firmId,
+      status: { $ne: 'deleted' },
+    })
+      .select('_id xID role firmId managerId reportsToUserId teamId teamIds')
+      .lean();
+
+    if (!targetUser) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have access to this worklist',
+      });
+    }
+
+    const canAccessWorklist = canViewUserWorklist(user, targetUser, { targetFirmId: firmId });
+    const isViewingOwnWorklist = targetAssigneeXID.toUpperCase() === String(user.xID || '').trim().toUpperCase();
+    if (!canAccessWorklist) {
+      return res.status(403).json({
+        success: false,
+        message: 'You do not have access to this worklist',
+      });
+    }
+
+    // Auto-reopen expired pending cases for this user/assignee
+    try {
+      await caseActionService.autoReopenExpiredPendingCases(targetAssigneeXID, firmId);
+    } catch (error) {
+      log.warn('[WORKLIST] Failed to auto-reopen expired pending cases:', error.message);
+    }
+    
+    // CANONICAL QUERY: assignedToXID = xID AND status IN (ASSIGNED, IN_PROGRESS, OPEN)
+    // This is the ONLY correct query for "My Worklist"
+    // Dashboard counts MUST use the same query
+    const worklistStatuses = [CaseStatus.ASSIGNED, CaseStatus.IN_PROGRESS, CaseStatus.OPEN, CaseStatus.QC_PENDING].filter(Boolean);
+    // Legacy test/migration compatibility when only OPEN/PENDING constants are available.
+    if (worklistStatuses.length <= 1 && CaseStatus.PENDING) {
+      worklistStatuses.push(CaseStatus.PENDING);
+    }
+
+    const defaultStatuses = worklistStatuses.map((statusValue) => String(statusValue || '').trim().toUpperCase());
+    const filteredStatuses = normalizedRequestedStatuses.length > 0
+      ? defaultStatuses.filter((statusValue) => normalizedRequestedStatuses.includes(statusValue))
+      : defaultStatuses;
+
+    const query = {
+      assignedToXID: targetAssigneeXID, // CANONICAL: Query by xID in assignedToXID field
+      // Assignment flow writes ASSIGNED; legacy/older records may still be OPEN/IN_PROGRESS.
+      // PENDING must be excluded because pending dockets are shown via /cases/my-pending.
+      status: { $in: filteredStatuses },
+    };
+    if (categoryFilter) {
+      query.category = categoryFilter;
+    }
+    if (subcategoryFilter) {
+      query.$or = [
+        { subcategory: subcategoryFilter },
+        { caseSubCategory: subcategoryFilter },
+      ];
+    }
+    if (search) {
+      const escapedSearch = search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const regex = new RegExp(escapedSearch, 'i');
+      query.$and = [
+        ...(Array.isArray(query.$and) ? query.$and : []),
+        {
+          $or: [
+            { caseId: regex },
+            { caseNumber: regex },
+            { clientId: regex },
+            { clientName: regex },
+            { category: regex },
+            { subcategory: regex },
+            { caseSubCategory: regex },
+          ],
+        },
+      ];
+    }
+    const sortFieldMap = {
+      caseId: 'caseId',
+      clientId: 'clientId',
+      clientName: 'clientName',
+      category: 'category',
+      subcategory: 'subcategory',
+      dueDate: 'dueDate',
+      pendingUntil: 'pendingUntil',
+      updatedAt: 'updatedAt',
+      createdAt: 'createdAt',
+    };
+    const sortField = sortFieldMap[sortBy] || 'createdAt';
+    
+    const casesQuery = Case.find(enforceTenantScope(query, req, { source: 'search.employeeWorklist' }))
+      .select('caseId caseNumber caseName category subcategory caseSubCategory dueDate slaDueAt createdAt createdBy updatedAt status clientId clientName assignedToXID assignedToName')
+      .sort({ [sortField]: sortOrder, _id: 1 })
+      .skip((normalizedPage - 1) * normalizedLimit)
+      .limit(normalizedLimit);
+
+    // ⚡ Bolt Performance Optimization:
+    // Replaced concurrent countDocuments() and find() queries with a single find() using limit(limit + 1) to eliminate redundant database round-trips.
+    // Notice that casesQuery already has .limit(normalizedLimit). We will change it.
+    const casesWithExtra = await Case.find(enforceTenantScope(query, req, { source: 'search.employeeWorklist' }))
+      .select('caseId caseNumber caseName category subcategory caseSubCategory dueDate slaDueAt createdAt createdBy updatedAt status clientId clientName assignedToXID assignedToName')
+      .sort({ [sortField]: sortOrder, _id: 1 })
+      .skip((normalizedPage - 1) * normalizedLimit)
+      .limit(normalizedLimit + 1)
+      .lean();
+
+    const hasMore = casesWithExtra.length > normalizedLimit;
+    const cases = hasMore ? casesWithExtra.slice(0, normalizedLimit) : casesWithExtra;
+    const total = hasMore ? ((normalizedPage - 1) * normalizedLimit) + normalizedLimit + 1 : ((normalizedPage - 1) * normalizedLimit) + cases.length;
+    logSlowWorklistQuery({
+      req,
+      queryName: 'employeeWorklist',
+      durationMs: Date.now() - startedAt,
+      firmId,
+      userXID: targetAssigneeXID,
+      page: normalizedPage,
+      limit: normalizedLimit,
+    });
+
+    const missingClientNameIds = [...new Set(
+      (cases || [])
+        .filter((c) => !c?.clientName && c?.clientId)
+        .map((c) => String(c.clientId).trim())
+        .filter(Boolean),
+    )];
+
+    let clientNameByClientId = new Map();
+    if (missingClientNameIds.length > 0) {
+      const clientDocs = await Client.find(
+        enforceTenantScope({ clientId: { $in: missingClientNameIds } }, req, { source: 'search.employeeWorklist.clientLookup' }),
+      )
+        .select('clientId businessName')
+        .lean();
+
+      clientNameByClientId = new Map(
+        (clientDocs || [])
+          .filter((client) => client?.clientId)
+          .map((client) => [String(client.clientId).trim(), client.businessName || null]),
+      );
+    }
+    
+    // Log case list view for audit
+    await logCaseListViewed({
+      viewerXID: user.xID,
+      filters: { status: filteredStatuses, assigneeXID: targetAssigneeXID },
+      listType: isViewingOwnWorklist ? 'MY_WORKLIST' : 'TEAM_WORKLIST',
+      resultCount: cases.length,
+      req,
+    });
+    
+    res.json({
+      success: true,
+      data: (cases || []).map(c => ({
+        _id: c._id, // Include _id for UI compatibility
+        caseId: c.caseId || c.caseNumber,
+        caseNumber: c.caseNumber || c.caseId,
+        caseName: c.caseName,
+        category: c.category,
+        subcategory: c.subcategory || c.caseSubCategory || null,
+        dueDate: c.dueDate || c.slaDueAt || null,
+        slaDueAt: c.slaDueAt || null,
+        createdAt: c.createdAt,
+        createdBy: c.createdBy,
+        updatedAt: c.updatedAt,
+        status: c.status,
+        assignedToXID: c.assignedToXID || null,
+        assignedToName: c.assignedToName || null,
+        clientId: c.clientId || null,
+        clientName: c.clientName || clientNameByClientId.get(String(c.clientId || '').trim()) || null,
+      })),
+      pagination: {
+        page: normalizedPage,
+        limit: normalizedLimit,
+        total,
+        pages: Math.ceil(total / normalizedLimit) || 1,
+      },
+    });
+  } catch (error) {
+    return handleControllerError({
+      req,
+      res,
+      error,
+      logEvent: 'EMPLOYEE_WORKLIST_FETCH_FAILED',
+      code: ERROR_CODES.EMPLOYEE_WORKLIST_FETCH_FAILED,
+      message: 'Error fetching employee worklist',
+      context: {
+        query: req.query || null,
+        userXID: req.user?.xID || null,
+        firmId: req.user?.firmId || null,
+      },
+    });
+  }
+};
+
+/**
+ * Global Worklist (Unassigned Cases Queue)
+ * GET /api/worklists/global
+ * 
+ * Returns all unassigned OPEN cases
+ * Supports server-side filtering and sorting
+ * 
+ * Query Parameters:
+ * - clientId: Filter by client ID
+ * - category: Filter by case category
+ * - createdAtFrom: Filter by creation date (start)
+ * - createdAtTo: Filter by creation date (end)
+ * - slaStatus: Filter by SLA status (overdue, due_soon, on_track)
+ * - sortBy: Field to sort by (clientId, category, slaDueAt/slaDueDate, createdAt)
+ * - sortOrder: Sort order (asc, desc)
+ * - page: Page number for pagination
+ * - limit: Results per page
+ * 
+ * Default sort: slaDueAt ASC
+ */
+const globalWorklist = async (req, res) => {
+  try {
+    const startedAt = Date.now();
+    const {
+      clientId,
+      category,
+      createdAtFrom,
+      createdAtTo,
+      status,
+      slaStatus,
+      sortBy = 'slaDueAt',
+      sortOrder = 'asc',
+      page = 1,
+      limit = 20,
+      tab = 'own',
+      workbasketId = '',
+    } = req.query;
+    const firmId = req.user?.firmId;
+
+    if (!firmId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firm context is required',
+      });
+    }
+    
+    const userTeamId = toObjectIdStringOrNull(req.user?.teamId);
+    const requestedWorkbasketId = toObjectIdStringOrNull(workbasketId);
+    const permittedTeamIds = new Set(
+      (Array.isArray(req.user?.teamIds) ? req.user.teamIds : [])
+        .map((entry) => toObjectIdStringOrNull(entry))
+        .filter(Boolean),
+    );
+    if (userTeamId) permittedTeamIds.add(userTeamId);
+    if (requestedWorkbasketId && !permittedTeamIds.has(requestedWorkbasketId)) {
+      return res.status(403).json({ success: false, message: 'Not allowed to view this workbasket' });
+    }
+    const selectedTeamId = requestedWorkbasketId || userTeamId;
+    const normalizedTab = String(tab || 'own').toLowerCase();
+    const parsedPage = Math.max(1, Number.parseInt(page, 10) || 1);
+    const parsedLimit = Math.min(100, Math.max(1, Number.parseInt(limit, 10) || 20));
+    const query = {
+      assignedToXID: null,
+      state: 'IN_WB',
+      status: { $nin: [CaseStatus.RESOLVED, CaseStatus.FILED] },
+    };
+
+    if (normalizedTab === 'routed' && selectedTeamId) {
+      query.routedToTeamId = selectedTeamId;
+      query.status = { $nin: [CaseStatus.RESOLVED, CaseStatus.FILED] };
+    } else {
+      if (selectedTeamId) {
+        query.ownerTeamId = selectedTeamId;
+      }
+      query.status = { $nin: [CaseStatus.RESOLVED, CaseStatus.FILED] };
+    }
+    
+    // Apply filters
+    if (clientId) {
+      query.clientId = clientId;
+    }
+    
+    if (category) {
+      query.category = category;
+    }
+
+    if (status) {
+      const requestedStatus = String(status).trim().toUpperCase();
+      if (!['RESOLVED', 'FILED'].includes(requestedStatus)) {
+        query.status = requestedStatus;
+      }
+    }
+    
+    // Date range filter
+    if (createdAtFrom || createdAtTo) {
+      query.createdAt = {};
+      if (createdAtFrom) {
+        const fromDate = new Date(createdAtFrom);
+        if (!Number.isNaN(fromDate.getTime())) {
+          query.createdAt.$gte = fromDate;
+        }
+      }
+      if (createdAtTo) {
+        const toDate = new Date(createdAtTo);
+        if (!Number.isNaN(toDate.getTime())) {
+          query.createdAt.$lte = toDate;
+        }
+      }
+      if (Object.keys(query.createdAt).length === 0) {
+        delete query.createdAt;
+      }
+    }
+    
+    // SLA status filter (computed based on slaDueAt)
+    if (slaStatus) {
+      const now = new Date();
+      const twoDaysFromNow = new Date(now.getTime() + 2 * 24 * 60 * 60 * 1000);
+      
+      if (slaStatus === 'overdue') {
+        // Cases where slaDueAt < now
+        query.slaDueAt = { $lt: now };
+      } else if (slaStatus === 'due_soon') {
+        // Cases where slaDueAt is between now and 2 days from now
+        query.slaDueAt = { $gte: now, $lte: twoDaysFromNow };
+      } else if (slaStatus === 'on_track') {
+        // Cases where slaDueAt > 2 days from now OR no slaDueAt
+        query.$or = [
+          { slaDueAt: { $gt: twoDaysFromNow } },
+          { slaDueAt: null },
+        ];
+      }
+    }
+    
+    // Build sort object
+    const normalizedSortBy = sortBy === 'slaDueDate' ? 'slaDueAt' : sortBy;
+
+    const sortFields = {
+      clientId: 'clientId',
+      category: 'category',
+      slaDueAt: 'slaDueAt',
+      createdAt: 'createdAt',
+    };
+    
+    const sortField = sortFields[normalizedSortBy] || 'slaDueAt';
+    const sortDirection = sortOrder === 'desc' ? -1 : 1;
+    const sort = { [sortField]: sortDirection };
+    
+    const baseQuery = enforceTenantScope({ ...query }, req, { source: 'search.globalWorklist.base' });
+    const projection = {
+      caseId: 1,
+      caseName: 1,
+      clientId: 1,
+      category: 1,
+      status: 1,
+      slaDueAt: 1,
+      createdAt: 1,
+      createdBy: 1,
+      ownerTeamId: 1,
+      routedToTeamId: 1,
+      routingNote: 1,
+    };
+    const skip = (parsedPage - 1) * parsedLimit;
+
+    const [allCases, total] = await (normalizedSortBy === 'slaDueAt' && !slaStatus
+      ? (async () => {
+          const [nonNullCases, nullCount, totalCount] = await Promise.all([
+            Case.find({ ...baseQuery, slaDueAt: { $ne: null } })
+              .select(projection)
+              .sort(sort)
+              .skip(skip)
+              .limit(parsedLimit)
+              .lean(),
+            Case.countDocuments({ ...baseQuery, slaDueAt: null }),
+            Case.countDocuments(baseQuery),
+          ]);
+          if (nonNullCases.length >= parsedLimit) {
+            return [nonNullCases, totalCount];
+          }
+          const nullSkip = Math.max(0, skip - Math.max(totalCount - nullCount, 0));
+          const nullCases = await Case.find({ ...baseQuery, slaDueAt: null })
+            .select(projection)
+            .sort({ createdAt: sortDirection, _id: 1 })
+            .skip(nullSkip)
+            .limit(parsedLimit - nonNullCases.length)
+            .lean();
+          return [[...nonNullCases, ...nullCases], totalCount];
+        })()
+      : Promise.all([
+          Case.find(baseQuery)
+            .select(projection)
+            .sort({ ...sort, _id: 1 })
+            .skip(skip)
+            .limit(parsedLimit)
+            .lean(),
+          Case.countDocuments(baseQuery),
+        ]));
+    const teamIds = [...new Set(
+      allCases
+        .flatMap((c) => [c.ownerTeamId, c.routedToTeamId])
+        .map((id) => toObjectIdStringOrNull(id))
+        .filter(Boolean),
+    )];
+    const teams = teamIds.length > 0
+      ? await Team.find({ _id: { $in: teamIds }, firmId }).select('_id name').lean()
+      : [];
+    const teamNameMap = new Map(teams.map((team) => [String(team._id), team.name]));
+    
+    // Calculate SLA days remaining for each case
+    const now = new Date();
+    const casesWithSLAInfo = allCases.map(c => {
+      let slaDaysRemaining = null;
+      if (c.slaDueAt) {
+        const dueDate = new Date(c.slaDueAt);
+        const diffTime = dueDate - now;
+        slaDaysRemaining = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      }
+      
+      return {
+        caseId: c.caseId,
+        caseName: c.caseName,
+        clientId: c.clientId,
+        status: c.status,
+        category: c.category,
+        slaDueAt: c.slaDueAt,
+        slaDaysRemaining,
+        createdAt: c.createdAt,
+        createdBy: c.createdBy,
+        ownerTeamId: c.ownerTeamId || null,
+        ownerTeamName: c.ownerTeamId ? (teamNameMap.get(String(c.ownerTeamId)) || null) : null,
+        routedToTeamId: c.routedToTeamId || null,
+        routedToTeamName: c.routedToTeamId ? (teamNameMap.get(String(c.routedToTeamId)) || null) : null,
+        routingNote: c.routingNote || null,
+      };
+    });
+    
+    logSlowWorklistQuery({
+      req,
+      queryName: 'globalWorklist',
+      durationMs: Date.now() - startedAt,
+      firmId,
+      userXID: req.user?.xID,
+      page: parsedPage,
+      limit: parsedLimit,
+    });
+    
+    // Log case list view for audit (if user is authenticated)
+    if (req.user?.xID) {
+      await logCaseListViewed({
+        viewerXID: req.user.xID,
+        filters: { 
+          clientId, 
+          category, 
+          slaStatus,
+          createdAtFrom,
+          createdAtTo,
+          tab: normalizedTab,
+        },
+        listType: 'GLOBAL_WORKLIST',
+        resultCount: casesWithSLAInfo.length,
+        req,
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: casesWithSLAInfo,
+      pagination: {
+        page: parsedPage,
+        limit: parsedLimit,
+        total,
+        pages: Math.ceil(total / parsedLimit),
+      },
+    });
+  } catch (error) {
+    return handleControllerError({
+      req,
+      res,
+      error,
+      logEvent: 'GLOBAL_WORKLIST_FETCH_FAILED',
+      code: ERROR_CODES.GLOBAL_WORKLIST_FETCH_FAILED,
+      message: 'Error fetching global worklist',
+      context: {
+        query: req.query || null,
+        userXID: req.user?.xID || null,
+        firmId: req.user?.firmId || null,
+      },
+    });
+  }
+};
+
+module.exports = {
+  globalSearch,
+  categoryWorklist,
+  employeeWorklist,
+  globalWorklist,
+};

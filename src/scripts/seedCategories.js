@@ -1,0 +1,91 @@
+const log = require('../utils/log');
+/**
+ * Seed Categories Script for Docketra
+ * 
+ * Purpose: Creates default system categories for the Docketra case management system
+ * 
+ * Usage:
+ *   1. Ensure MongoDB is running and MONGODB_URI is set in .env file
+ *   2. Run: node src/scripts/seedCategories.js
+ *   3. The script will check if categories exist before creating to prevent duplicates
+ * 
+ * Default Categories:
+ *   - Sales, Accounting, Expenses, Payroll, HR, Compliance
+ *   - Core Business, Management Review
+ *   - Client - New, Client - Edit
+ *   - Internal
+ * 
+ * All seeded categories are marked as isSystem: true to prevent deletion
+ */
+
+require('dotenv').config();
+const mongoose = require('mongoose');
+const Category = require('../models/Category.model');
+
+// Default system categories
+const defaultCategories = [
+  'Sales',
+  'Accounting',
+  'Expenses',
+  'Payroll',
+  'HR',
+  'Compliance',
+  'Core Business',
+  'Management Review',
+  'Client - New',
+  'Client - Edit',
+  'Client - Delete',
+  'Internal',
+];
+
+const seedCategories = async () => {
+  try {
+    // Connect to MongoDB
+    log.info('Connecting to MongoDB...');
+    await mongoose.connect(process.env.MONGODB_URI);
+    log.info('✓ MongoDB Connected');
+
+    let createdCount = 0;
+    let skippedCount = 0;
+
+    // Process each category
+    for (const categoryName of defaultCategories) {
+      // Check if category already exists
+      const existingCategory = await Category.findOne({ name: categoryName });
+      
+      if (existingCategory) {
+        log.info(`ℹ Category "${categoryName}" already exists. Skipping.`);
+        skippedCount++;
+      } else {
+        // Create new system category
+        const category = new Category({
+          name: categoryName,
+          isSystem: true,
+          isActive: true,
+        });
+
+        await category.save();
+        log.info(`✓ Created system category: "${categoryName}"`);
+        createdCount++;
+      }
+    }
+
+    // Summary
+    log.info('\n--- Summary ---');
+    log.info(`✓ Categories created: ${createdCount}`);
+    log.info(`ℹ Categories skipped: ${skippedCount}`);
+    log.info(`✓ Total categories processed: ${defaultCategories.length}`);
+
+  } catch (error) {
+    log.error('✗ Error seeding categories:', error);
+    process.exit(1);
+  } finally {
+    // Close the database connection
+    await mongoose.connection.close();
+    log.info('\n✓ Database connection closed');
+    process.exit(0);
+  }
+};
+
+// Run the seed script
+seedCategories();

@@ -1,0 +1,374 @@
+/**
+ * Axios API Client Configuration
+ * Updated for JWT Bearer token authentication
+ */
+
+import axios from 'axios';
+import { API_BASE_URL, ERROR_CODES, SESSION_KEYS, STORAGE_KEYS } from '../utils/constants';
+import { clearPendingLoginSessionState, clearSuperadminRoutingHints } from '../utils/authSessionCleanup';
+import { isPublicAuth401Suppressed, isPublicAuthPagePath, resolveAuthRedirectDestination } from '../utils/authRedirects';
+import { emitOnboardingProgressRefresh, shouldRefreshOnboardingProgress } from '../utils/onboardingProgressRefresh';
+import { createCorrelationId, emitDiagnosticEvent, shouldEmitWarning } from '../utils/workflowDiagnostics';
+import { safeConsole } from '../utils/safeConsole';
+import { generateSecureRandomString, generateUUID } from '../utils/crypto';
+
+const api = axios.create({
+  baseURL: API_BASE_URL,
+  withCredentials: true,
+  headers: {
+    'Content-Type': 'application/json',
+  },
+});
+
+if (typeof window !== 'undefined' && !window.__docketraNavigationActivityPatched) {
+  const notifyNavigationActivity = () => {
+    window.dispatchEvent(new CustomEvent('app:navigation'));
+  };
+  const wrapHistoryMethod = (methodName) => {
+    const original = window.history?.[methodName];
+    if (typeof original !== 'function') return;
+    window.history[methodName] = function patchedHistoryMethod(...args) {
+      const result = original.apply(this, args);
+      notifyNavigationActivity();
+      return result;
+    };
+  };
+  wrapHistoryMethod('pushState');
+  window.__docketraNavigationActivityPatched = true;
+}
+
+let redirecting = false;
+let refreshFailureDetected = false;
+const inFlightRequestCounts = new Map();
+const requestStartedAtById = new Map();
+const SLOW_API_THRESHOLD_MS = 900;
+const buildRequestSignature = (config) => {
+  const method = String(config?.method || 'get').toUpperCase();
+  const url = String(config?.url || '');
+  const params = config?.params ? JSON.stringify(config.params) : '';
+  return `${method} ${url} ${params}`;
+};
+const buildWorkflowName = (config) => {
+  const method = String(config?.method || 'get').toLowerCase();
+  const url = String(config?.url || '').replace(/[0-9a-f]{24}/gi, ':id');
+  return `${method}:${url || 'unknown'}`.slice(0, 120);
+};
+const markErrorToasted = (error, message) => {
+  if (!error) return;
+  error.uiFeedback = {
+    ...(error.uiFeedback || {}),
+    toasted: true,
+    message,
+  };
+};
+const REDIRECT_TIMEOUT_MS = 5000;
+const INITIAL_BACKOFF_MS = 1000;
+const MAX_BACKOFF_MS = 4000;
+const SAME_ORIGIN_API_BASE_URL = '/api';
+const isPublicAuthFlowRequest = (requestConfig) => {
+  const requestUrl = String(requestConfig?.url || '');
+  return /\/auth\/(resend-otp|verify-totp|complete-mfa-login|forgot-password|forgot-password\/init|forgot-password\/verify|forgot-password\/reset|reset-password-with-token|resend-credentials|login\/init|login\/verify|login\/resend)$/.test(requestUrl)
+    || /\/verify-otp$/.test(requestUrl)
+    || /\/login$/.test(requestUrl);
+};
+const isRefreshRequest = (requestConfig) => /\/auth\/refresh$/.test(String(requestConfig?.url || ''));
+const isLoginLikePath = (pathname) => isPublicAuthPagePath(pathname) || pathname.includes('/auth/login');
+
+
+function generateIdempotencyKey() {
+  return generateUUID();
+}
+
+// Request interceptor - add idempotency/impersonation headers
+api.interceptors.request.use(
+  (config) => {
+    const requestId = `${Date.now()}-${generateSecureRandomString(8)}`;
+    const signature = buildRequestSignature(config);
+    const workflow = buildWorkflowName(config);
+    const correlationId = config?.metadata?.correlationId || createCorrelationId(workflow);
+    config.metadata = {
+      ...(config.metadata || {}),
+      requestId,
+      signature,
+      workflow,
+      correlationId,
+    };
+    config.headers = config.headers || {};
+    config.headers['X-Correlation-ID'] = correlationId;
+    requestStartedAtById.set(requestId, performance.now());
+    const activeCount = (inFlightRequestCounts.get(signature) || 0) + 1;
+    inFlightRequestCounts.set(signature, activeCount);
+    if (activeCount > 1) {
+      const warningKey = `dup:${signature}`;
+      if (shouldEmitWarning(warningKey)) {
+        emitDiagnosticEvent('warn', 'duplicate_api_request', { signature, activeCount, workflow, correlationId });
+      }
+    }
+
+    const method = (config.method || '').toLowerCase();
+    if (typeof window !== 'undefined' && config?.metadata?.userInitiatedActivity === true) {
+      window.dispatchEvent(new CustomEvent('app:api-activity', {
+        detail: { userInitiated: true }
+      }));
+    }
+    if (['post', 'put', 'patch', 'delete'].includes(method)) {
+      const hasIdempotencyKey = typeof config.headers?.has === 'function'
+        ? config.headers.has('Idempotency-Key') || config.headers.has('idempotency-key')
+        : Object.keys(config.headers || {}).some((headerName) => headerName.toLowerCase() === 'idempotency-key');
+      if (!hasIdempotencyKey) {
+        if (typeof config.headers?.set === 'function') {
+          config.headers.set('Idempotency-Key', generateIdempotencyKey());
+        } else {
+          config.headers = config.headers || {};
+          config.headers['Idempotency-Key'] = generateIdempotencyKey();
+        }
+      }
+    }
+
+    // Add impersonation header if SuperAdmin is impersonating a firm
+    const requestUrl = String(config?.url || '');
+    const isSuperadminApiRequest = requestUrl.startsWith('/superadmin');
+    const impersonatedFirm = localStorage.getItem(STORAGE_KEYS.IMPERSONATED_FIRM);
+    if (impersonatedFirm && !isSuperadminApiRequest) {
+      try {
+        const firmData = JSON.parse(impersonatedFirm);
+        if (firmData?.impersonatedFirmId) {
+          config.headers['X-Impersonated-Firm-Id'] = firmData.impersonatedFirmId;
+        }
+        if (firmData?.sessionId) {
+          config.headers['X-Impersonation-Session-Id'] = firmData.sessionId;
+        }
+        if (firmData?.impersonationMode) {
+          config.headers['X-Impersonation-Mode'] = firmData.impersonationMode;
+        }
+      } catch (error) {
+        safeConsole.error('[API] Failed to parse impersonated firm data from localStorage. Data may be corrupted. Please clear impersonation state and try again.', { message: error?.message });
+        // Clear corrupted data
+        localStorage.removeItem(STORAGE_KEYS.IMPERSONATED_FIRM);
+      }
+    }
+    
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// Response interceptor - Handle token expiry and refresh
+api.interceptors.response.use(
+  (response) => {
+    const requestId = response?.config?.metadata?.requestId;
+    const signature = response?.config?.metadata?.signature;
+    const startedAt = requestId ? requestStartedAtById.get(requestId) : null;
+    if (requestId) requestStartedAtById.delete(requestId);
+    if (signature) {
+      const remaining = Math.max(0, (inFlightRequestCounts.get(signature) || 1) - 1);
+      if (remaining === 0) inFlightRequestCounts.delete(signature);
+      else inFlightRequestCounts.set(signature, remaining);
+    }
+    if (startedAt) {
+      const durationMs = Math.round(performance.now() - startedAt);
+      if (durationMs >= SLOW_API_THRESHOLD_MS) {
+        emitDiagnosticEvent('warn', 'slow_api_response', { signature, workflow: response?.config?.metadata?.workflow, correlationId: response?.config?.metadata?.correlationId, requestId: response?.headers?.['x-request-id'] || null, durationMs, status: response?.status });
+      }
+      emitDiagnosticEvent('info', 'api_response', { signature, workflow: response?.config?.metadata?.workflow, correlationId: response?.config?.metadata?.correlationId, requestId: response?.headers?.['x-request-id'] || null, durationMs, status: response?.status });
+    }
+    if (/\/auth\/(profile|refresh)$/.test(String(response?.config?.url || ''))) {
+      refreshFailureDetected = false;
+    }
+    if (shouldRefreshOnboardingProgress({ method: response?.config?.method, url: response?.config?.url })) {
+      emitOnboardingProgressRefresh({
+        method: response?.config?.method,
+        url: response?.config?.url,
+      });
+    }
+    if (response?.data?.idempotent === true) {
+      window.dispatchEvent(new CustomEvent('app:idempotent'));
+    }
+    return response;
+  },
+  async (error) => {
+    const requestId = error?.config?.metadata?.requestId;
+    const signature = error?.config?.metadata?.signature;
+    if (requestId) {
+      requestStartedAtById.delete(requestId);
+    }
+    if (signature) {
+      const remaining = Math.max(0, (inFlightRequestCounts.get(signature) || 1) - 1);
+      if (remaining === 0) inFlightRequestCounts.delete(signature);
+      else inFlightRequestCounts.set(signature, remaining);
+    }
+    const originalRequest = error.config;
+    const status = error.response?.status;
+    emitDiagnosticEvent('error', 'api_error', {
+      signature,
+      workflow: error?.config?.metadata?.workflow,
+      correlationId: error?.config?.metadata?.correlationId,
+      status,
+      code: error?.response?.data?.code || error?.code || null,
+      retried: Boolean(originalRequest?._retry),
+      networkRetryCount: originalRequest?._networkRetryCount || 0,
+      requestId: error?.response?.headers?.['x-request-id'] || null,
+    });
+    if (redirecting) {
+      return Promise.reject(error);
+    }
+    const hasResponse = !!error.response;
+    const firmSlug = localStorage.getItem(STORAGE_KEYS.FIRM_SLUG);
+    const currentPath = String(window.location.pathname || '');
+    const isPublicAuthPage = isPublicAuthPagePath(currentPath);
+    const isProfileRequest = /\/auth\/profile$/.test(String(originalRequest?.url || ''));
+    const isAuthStateRequest = isProfileRequest || isRefreshRequest(originalRequest);
+    const skipAuthRedirect = Boolean(originalRequest?.metadata?.skipAuthRedirect);
+    const shouldSuppressPublicAuthHandling = isPublicAuth401Suppressed({ pathname: currentPath, isAuthStateRequest });
+    const redirectToLogin = () => {
+      if (redirecting) return;
+      redirecting = true;
+      const destination = resolveAuthRedirectDestination({
+        pathname: window.location.pathname,
+        storedFirmSlug: firmSlug,
+      });
+      const currentPath = window.location.pathname || '';
+      const alreadyOnLoginRoute = currentPath === destination || isLoginLikePath(currentPath);
+      if (alreadyOnLoginRoute) {
+        safeConsole.info('[AUTH] Skipping hard redirect: already on login route.', { currentPath, destination });
+        redirecting = false;
+        return;
+      }
+      window.location.assign(destination);
+      // Fallback reset in case navigation is blocked
+      setTimeout(() => { redirecting = false; }, REDIRECT_TIMEOUT_MS);
+    };
+    const clearAuthStorage = () => {
+      const currentPath = String(window.location.pathname || '');
+      const inSuperadminNamespace = currentPath.startsWith('/app/superadmin') || currentPath.startsWith('/superadmin');
+      if (inSuperadminNamespace) {
+        clearSuperadminRoutingHints(localStorage);
+      }
+      clearPendingLoginSessionState(sessionStorage);
+      window.dispatchEvent(new CustomEvent('auth:logout', { detail: { inSuperadminNamespace } }));
+    };
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    // Network errors (no response) - retry with bounded exponential backoff
+    if (!hasResponse) {
+      const retries = originalRequest?._networkRetryCount || 0;
+      if (retries < 2) {
+        const backoffMs = Math.min(INITIAL_BACKOFF_MS * 2 ** retries, MAX_BACKOFF_MS);
+        originalRequest._networkRetryCount = retries + 1;
+        await delay(backoffMs);
+        return api(originalRequest);
+      }
+
+      const currentBaseUrl = String(originalRequest?.baseURL || api.defaults.baseURL || '');
+      const hasTriedSameOriginFallback = Boolean(originalRequest?._sameOriginFallbackTried);
+      const canFallbackToSameOrigin = !hasTriedSameOriginFallback && currentBaseUrl !== SAME_ORIGIN_API_BASE_URL;
+      if (canFallbackToSameOrigin) {
+        originalRequest._sameOriginFallbackTried = true;
+        originalRequest._networkRetryCount = 0;
+        originalRequest.baseURL = SAME_ORIGIN_API_BASE_URL;
+        emitDiagnosticEvent('warn', 'api_network_fallback_same_origin', {
+          previousBaseUrl: currentBaseUrl,
+          fallbackBaseUrl: SAME_ORIGIN_API_BASE_URL,
+          workflow: originalRequest?.metadata?.workflow,
+          correlationId: originalRequest?.metadata?.correlationId,
+        });
+        return api(originalRequest);
+      }
+
+      const message = 'Network error. Please check your connection and retry.';
+      sessionStorage.setItem(SESSION_KEYS.GLOBAL_TOAST, JSON.stringify({
+        message,
+        type: 'danger'
+      }));
+      markErrorToasted(error, message);
+      return Promise.reject(error);
+    }
+    
+    // Handle token expiry
+    if (status === 401 && refreshFailureDetected && !isPublicAuthFlowRequest(originalRequest)) {
+      if (shouldSuppressPublicAuthHandling || skipAuthRedirect) {
+        return Promise.reject(error);
+      }
+      clearAuthStorage();
+      redirectToLogin();
+      return Promise.reject(error);
+    }
+
+    if (
+      status === 401
+      && !originalRequest._retry
+      && !isPublicAuthFlowRequest(originalRequest)
+      && !isRefreshRequest(originalRequest)
+      && !(isPublicAuthPage && isProfileRequest)
+      && !skipAuthRedirect
+    ) {
+      originalRequest._retry = true;
+      
+      try {
+        await api.post('/auth/refresh');
+        refreshFailureDetected = false;
+        return api(originalRequest);
+      } catch (refreshError) {
+        // Refresh failed - clear storage and redirect to login
+        refreshFailureDetected = true;
+        console.warn('[AUTH] Refresh failed. Resolving session as unauthenticated.', {
+          refreshStatus: refreshError?.response?.status || null,
+          refreshCode: refreshError?.code || refreshError?.response?.data?.code || null,
+        });
+        clearAuthStorage();
+        const refreshCode = refreshError?.code || refreshError?.response?.data?.code;
+        sessionStorage.setItem(SESSION_KEYS.GLOBAL_TOAST, JSON.stringify({
+          message: refreshCode === ERROR_CODES.REFRESH_NOT_SUPPORTED
+            ? 'Your admin session has expired. Please sign in again.'
+            : 'Your session has expired. Please sign in again.',
+          type: 'info',
+          code: ERROR_CODES.AUTH_SESSION_EXPIRED,
+        }));
+        redirectToLogin();
+        return Promise.reject(refreshError);
+      }
+    }
+    
+    // Handle other 401 errors (invalid token, etc.)
+    if (status === 401) {
+      if (isPublicAuthFlowRequest(originalRequest) || shouldSuppressPublicAuthHandling || skipAuthRedirect) {
+        return Promise.reject(error);
+      }
+      clearAuthStorage();
+      sessionStorage.setItem(SESSION_KEYS.GLOBAL_TOAST, JSON.stringify({
+        message: 'Your session has expired. Please sign in again.',
+        type: 'info',
+        code: ERROR_CODES.AUTH_SESSION_EXPIRED,
+      }));
+      redirectToLogin();
+      return Promise.reject(error);
+    }
+
+    // Handle authorization failures without force-logging the user out.
+    // A 403 typically means "not allowed for this action" (RBAC/tenant guard),
+    // not "session is invalid". Keep auth state intact so users can navigate back.
+    if (status === 403) {
+      sessionStorage.setItem(SESSION_KEYS.GLOBAL_TOAST, JSON.stringify({
+        message: 'You are not allowed to perform that action. Your session is still active.',
+        type: 'warning'
+      }));
+      markErrorToasted(error, 'You are not allowed to perform that action.');
+      return Promise.reject(error);
+    }
+
+    if (status >= 500) {
+      const message = 'A server error occurred. Please try again shortly.';
+      sessionStorage.setItem(SESSION_KEYS.GLOBAL_TOAST, JSON.stringify({
+        message,
+        type: 'danger'
+      }));
+      markErrorToasted(error, message);
+    }
+    
+    return Promise.reject(error);
+  }
+);
+
+export default api;

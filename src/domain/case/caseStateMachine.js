@@ -1,0 +1,86 @@
+const CaseStatus = require('./caseStatus');
+
+const STATUS_ALIASES = Object.freeze({
+  [CaseStatus.PENDING_LEGACY]: CaseStatus.PENDING,
+  [CaseStatus.OPEN_LEGACY]: CaseStatus.OPEN,
+  [CaseStatus.FILED_LEGACY]: CaseStatus.FILED,
+  [CaseStatus.REVIEWED]: CaseStatus.UNDER_REVIEW,
+  [CaseStatus.ARCHIVED]: CaseStatus.CLOSED,
+});
+
+function normalizeStatus(status) {
+  return STATUS_ALIASES[status] || status;
+}
+
+const transitions = Object.freeze({
+  [CaseStatus.DRAFT]: Object.freeze([
+    CaseStatus.SUBMITTED,
+  ]),
+  [CaseStatus.SUBMITTED]: Object.freeze([
+    CaseStatus.UNDER_REVIEW,
+    CaseStatus.REJECTED,
+  ]),
+  [CaseStatus.UNDER_REVIEW]: Object.freeze([
+    CaseStatus.APPROVED,
+    CaseStatus.REJECTED,
+  ]),
+  [CaseStatus.REJECTED]: Object.freeze([
+    CaseStatus.DRAFT,
+    CaseStatus.CLOSED,
+  ]),
+  [CaseStatus.APPROVED]: Object.freeze([
+    CaseStatus.OPEN,
+  ]),
+  [CaseStatus.UNASSIGNED]: Object.freeze([
+    CaseStatus.ASSIGNED,
+  ]),
+  [CaseStatus.ASSIGNED]: Object.freeze([
+    CaseStatus.IN_PROGRESS,
+  ]),
+  [CaseStatus.IN_PROGRESS]: Object.freeze([
+    CaseStatus.OPEN,
+    CaseStatus.PENDING,
+    CaseStatus.FILED,
+    CaseStatus.RESOLVED,
+  ]),
+  [CaseStatus.OPEN]: Object.freeze([
+    CaseStatus.PENDING,
+    CaseStatus.FILED,
+    CaseStatus.RESOLVED,
+  ]),
+  [CaseStatus.PENDING]: Object.freeze([
+    CaseStatus.OPEN,
+    CaseStatus.FILED,
+  ]),
+  [CaseStatus.FILED]: Object.freeze([]),
+  [CaseStatus.RESOLVED]: Object.freeze([]),
+  [CaseStatus.CLOSED]: Object.freeze([]),
+});
+
+function canTransition(from, to, _role = null) {
+  const normalizedFrom = normalizeStatus(from);
+  const normalizedTo = normalizeStatus(to);
+  if (!transitions[normalizedFrom]) return false;
+  return transitions[normalizedFrom].includes(normalizedTo);
+}
+
+function assertValidTransition(from, to) {
+  const normalizedFrom = normalizeStatus(from);
+  const normalizedTo = normalizeStatus(to);
+  const allowedNextStatuses = transitions[normalizedFrom] || [];
+  if (allowedNextStatuses.includes(normalizedTo)) {
+    return true;
+  }
+
+  const error = new Error(`Invalid case transition: ${from || 'UNKNOWN'} -> ${to || 'UNKNOWN'}`);
+  error.code = 'INVALID_CASE_TRANSITION';
+  error.statusCode = 400;
+  throw error;
+}
+
+module.exports = {
+  transitions,
+  normalizeStatus,
+  canTransition,
+  assertValidTransition,
+};

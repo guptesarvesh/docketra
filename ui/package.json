@@ -1,0 +1,80 @@
+{
+  "name": "docketra-ui",
+  "version": "1.0.0",
+  "description": "Enterprise UI for Docketra B2B SaaS Platform",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@tanstack/react-query": "^5.99.0",
+    "axios": "^1.6.2",
+    "framer-motion": "file:vendor/framer-motion",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-hook-form": "^7.48.2",
+    "react-router-dom": "^6.20.0",
+    "socket.io-client": "^4.8.3",
+    "yup": "^1.3.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.7.0",
+    "autoprefixer": "^10.4.16",
+    "postcss": "^8.4.31",
+    "tailwindcss": "^3.4.1",
+    "vite": "^5.4.21",
+    "playwright": "^1.59.1"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test:dockets-route": "node tests/docketsRouteReliability.test.mjs",
+    "test:navigation": "node tests/navigationReliability.test.mjs",
+    "test:forms": "node tests/formReliabilityHardening.test.mjs",
+    "test:shells": "node tests/firmWorkspaceShellUnification.test.mjs",
+    "test:command-center": "node tests/workspaceCommandCenter.test.mjs",
+    "test:workbasket-sidebar-direct-links": "node tests/workbasketSidebarDirectLinks.test.mjs",
+    "test:sidebar-active": "node tests/sidebarActiveStateReliability.test.mjs",
+    "test:navigation-actions": "node tests/navigationActionInventory.test.mjs",
+    "test:crm-unification": "node tests/crmWorkspaceUnification.test.mjs",
+    "test:performance-patterns": "node tests/performancePatterns.test.mjs",
+    "test:case-detail-performance": "node tests/caseDetailPerformanceRefactor.test.mjs",
+    "test:case-detail-architecture": "node tests/caseDetailArchitectureSmoke.test.mjs",
+    "test:admin-surface": "node tests/adminSurfaceHardening.test.mjs",
+    "test:auth-refresh-loop": "node tests/authRefreshLoopRegression.test.mjs",
+    "test:public-landing-route-smoke": "node tests/publicLandingRouteSmoke.test.mjs",
+    "test:routing-public-boundary": "node tests/routingPublicBoundaryRegression.test.mjs",
+    "test:auth-redirect-behavior": "node tests/authRedirectBehavior.test.mjs",
+    "test:post-login-flow": "node tests/postLoginFlowRegression.test.mjs",
+    "test:firm-login-workspace-status": "node tests/firmLoginWorkspaceStatus.test.mjs",
+    "test:public-auth-routing-sanity": "npm run test:public-landing-route-smoke && npm run test:routing-public-boundary && npm run test:auth-redirect-behavior && npm run test:post-login-flow",
+    "test:docket-surface": "node tests/docketSurfaceHardening.test.mjs",
+    "test:cfs-info-flow": "node tests/cfsInfoButtonFlow.test.mjs",
+    "test:queue-ux-consistency": "node tests/queueUxConsistency.test.mjs",
+    "test:reports-dashboard-states": "node tests/reportsDashboardLoadingStates.test.mjs",
+    "test:design-system-contract": "node tests/designSystemContract.test.mjs",
+    "test:storage-service-contract": "node tests/storageServiceContract.test.mjs",
+    "test:superadmin-routes": "node tests/superadminRouteSuspense.test.mjs",
+    "test:auth-reliability-routes": "node tests/authReliabilityRouteGuards.test.mjs",
+    "test:ci": "npm run test:dockets-route && npm run test:navigation && npm run test:forms && npm run test:auth-refresh-loop && npm run test:routing-public-boundary && npm run test:admin-surface && npm run test:docket-surface && npm run test:queue-ux-consistency && npm run test:reports-dashboard-states && npm run test:design-system-contract && npm run test:storage-service-contract && npm run test:superadmin-routes && npm run test:auth-reliability-routes && npm run test:case-detail-performance && npm run test:case-detail-architecture && npm run test:superadmin-screen-reliability && npm run test:work-type-normalization",
+    "test:browser-route-inventory": "node tests/browserRouteActionInventory.test.mjs",
+    "test:superadmin-screen-reliability": "node tests/superadminScreenReliability.test.mjs",
+    "test:knowledge-item-detail-view": "node tests/knowledgeItemDetailView.test.mjs",
+    "test:work-type-normalization": "node tests/workTypeNormalization.test.mjs",
+    "test:landing-page": "node tests/companyBrainLandingPage.test.mjs",
+    "test:company-brain-command-center": "node tests/companyBrainCommandCenterSimplification.test.mjs",
+    "test:pilot-ui-contracts": "node tests/pilotUiContracts.test.mjs",
+    "test:auth-ui-ux": "node tests/authUiUxHardening.test.mjs"
+  },
+  "browserslist": {
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version",
+      "last 1 firefox version",
+      "last 1 safari version"
+    ]
+  }
+}

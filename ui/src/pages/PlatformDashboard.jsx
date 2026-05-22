@@ -1,0 +1,369 @@
+/**
+ * Platform Dashboard
+ * SuperAdmin view of platform-level metrics
+ */
+
+import React, { useState, useEffect, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { superadminService } from '../services/superadminService';
+import { SuperAdminLayout } from '../components/common/SuperAdminLayout';
+import { Card } from '../components/common/Card';
+import { Badge } from '../components/common/Badge';
+import { Button } from '../components/common/Button';
+import { MetricCard } from '../components/reports/MetricCard';
+import { Loading } from '../components/common/Loading';
+import { EmptyState } from '../components/ui/EmptyState';
+import { useToast } from '../hooks/useToast';
+import { productUpdatesService } from '../services/productUpdatesService';
+import { APP_VERSION } from '../utils/constants';
+import { loadPlatformOverviewData } from '../utils/platformOverviewLoader';
+
+export const PlatformDashboard = () => {
+  const MAX_UPDATE_BULLETS = 5;
+  const navigate = useNavigate();
+  const toast = useToast();
+  
+  const emptyStats = {
+    totalFirms: 0,
+    activeFirms: 0,
+    inactiveFirms: 0,
+    totalClients: 0,
+    totalUsers: 0,
+  };
+  const [loading, setLoading] = useState(true);
+  const [updateForm, setUpdateForm] = useState({
+    title: '',
+    bullets: ['', '', ''],
+    isPublished: true,
+    version: '',
+  });
+  const [publishingUpdate, setPublishingUpdate] = useState(false);
+  const [stats, setStats] = useState(emptyStats);
+  const [onboardingInsights, setOnboardingInsights] = useState(null);
+  const [onboardingAlerts, setOnboardingAlerts] = useState([]);
+  const isFetchingRef = useRef(false);
+  const hasLoadedRef = useRef(false);
+  const hasShownErrorRef = useRef(false);
+  const normalizeStats = (data) => {
+    const safeData = (data && typeof data === 'object') ? data : {};
+    const toNumber = (value) => {
+      const parsed = Number(value);
+      return Number.isFinite(parsed) ? parsed : 0;
+    };
+    const totalFirms = toNumber(safeData.totalFirms);
+    const activeFirms = toNumber(safeData.activeFirms);
+    const inactiveFirms = toNumber(safeData.inactiveFirms);
+    return {
+      totalFirms,
+      activeFirms,
+      inactiveFirms,
+      totalClients: toNumber(safeData.totalClients),
+      totalUsers: toNumber(safeData.totalUsers),
+    };
+  };
+
+  // Load platform stats once per dashboard load
+  useEffect(() => {
+    if (!hasLoadedRef.current && !isFetchingRef.current) {
+      loadStats();
+    }
+  }, []);
+
+  const loadStats = async () => {
+    if (isFetchingRef.current) {
+      return;
+    }
+    isFetchingRef.current = true;
+    try {
+      setLoading(true);
+      const { statsResponse: response, onboardingResponse } = await loadPlatformOverviewData({
+        getPlatformStats: superadminService.getPlatformStats,
+        getOnboardingInsights: superadminService.getOnboardingInsights,
+      });
+      let alertResponse = null;
+      try {
+        alertResponse = await superadminService.getOnboardingAlerts({ status: 'open', limit: 3, staleAfterDays: 7, sinceDays: 30 });
+      } catch (alertError) {
+        alertResponse = null;
+      }
+      
+      // HTTP 304 means cached data is still valid - keep current state
+      if (response?.status !== 304) {
+        if (response?.success) {
+          setStats(normalizeStats(response.data));
+          if (onboardingResponse?.success) {
+            setOnboardingInsights(onboardingResponse.data);
+          } else {
+            setOnboardingInsights(null);
+          }
+          setOnboardingAlerts(alertResponse?.success ? (alertResponse.data?.alerts || []) : []);
+        } else if (response?.degraded) {
+          setStats(normalizeStats(response.data));
+        } else if (!hasShownErrorRef.current) {
+          setStats(emptyStats);
+          toast.error('Failed to load platform statistics');
+          hasShownErrorRef.current = true;
+        }
+      }
+    } catch (error) {
+      // Don't reset stats on error - preserve existing data
+      if (!hasShownErrorRef.current) {
+        setStats(emptyStats);
+        toast.error('Failed to load platform statistics');
+        hasShownErrorRef.current = true;
+      }
+      console.error('Error loading platform stats:', error);
+    } finally {
+      hasLoadedRef.current = true;
+      setLoading(false);
+      isFetchingRef.current = false;
+    }
+  };
+
+  const handleCreateUpdate = async (event) => {
+    event.preventDefault();
+    const content = updateForm.bullets.map((item) => item.trim()).filter(Boolean);
+    if (!updateForm.title.trim() || content.length === 0) {
+      toast.error('Add a title and at least one bullet point.');
+      return;
+    }
+    if (content.length > MAX_UPDATE_BULLETS) {
+      toast.error(`Use ${MAX_UPDATE_BULLETS} bullet points or fewer.`);
+      return;
+    }
+
+    try {
+      setPublishingUpdate(true);
+      const response = await productUpdatesService.create({
+        title: updateForm.title.trim(),
+        content,
+        isPublished: updateForm.isPublished,
+        version: updateForm.version.trim() || undefined,
+      });
+      if (response?.success) {
+        toast.success('Product update published.');
+        setUpdateForm({ title: '', bullets: ['', '', ''], isPublished: true, version: '' });
+      } else {
+        toast.error(response?.message || 'Failed to publish update.');
+      }
+    } catch (error) {
+      toast.error(error?.response?.data?.message || 'Failed to publish update.');
+    } finally {
+      setPublishingUpdate(false);
+    }
+  };
+
+  const handleBulletChange = (index, value) => {
+    setUpdateForm((prev) => {
+      const nextBullets = [...prev.bullets];
+      nextBullets[index] = value;
+      return { ...prev, bullets: nextBullets };
+    });
+  };
+
+  const handleAddBullet = () => {
+    if (updateForm.bullets.length >= MAX_UPDATE_BULLETS) {
+      toast.error(`Maximum ${MAX_UPDATE_BULLETS} bullet points allowed.`);
+      return;
+    }
+    setUpdateForm((prev) => ({ ...prev, bullets: [...prev.bullets, ''] }));
+  };
+
+  const handleRemoveBullet = (indexToRemove) => {
+    setUpdateForm((prev) => ({
+      ...prev,
+      bullets: prev.bullets.filter((_, index) => index !== indexToRemove),
+    }));
+  };
+
+  if (loading) {
+    return (
+      <SuperAdminLayout>
+        <Loading message="Loading platform data..." />
+      </SuperAdminLayout>
+    );
+  }
+
+  return (
+    <SuperAdminLayout>
+      <div className="mx-auto w-full max-w-7xl space-y-8">
+          <div className="space-y-2">
+            <h1 className="text-2xl font-semibold text-gray-900 tracking-tight">Platform Overview</h1>
+            <p className="text-sm text-gray-500">
+              Manage firms on the Docketra platform. Operational work is handled within firms.
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 sm:grid-cols-2 lg:grid-cols-4">
+            <MetricCard
+              title="Total Firms"
+              value={stats.totalFirms}
+              subtitle={
+                stats.totalFirms === 0
+                  ? 'No firms exist yet. This is expected.'
+                  : `${stats.activeFirms} Active • ${stats.inactiveFirms} Inactive`
+              }
+              onClick={() => navigate('/app/superadmin/firms')}
+            />
+            <MetricCard
+              title="Active Firms"
+              value={stats.activeFirms}
+              subtitle="Currently enabled firms"
+              subtitleClassName="text-green-600"
+            />
+            <MetricCard
+              title="Total Clients"
+              value={stats.totalClients}
+              subtitle={stats.totalClients === 0 ? 'No clients yet. Create a firm to begin.' : 'Across all firms'}
+            />
+            <MetricCard
+              title="Total Users"
+              value={stats.totalUsers}
+              subtitle={stats.totalUsers === 0 ? 'No users yet. Create a firm to begin.' : 'Across all firms'}
+            />
+          </div>
+
+          {stats.totalFirms === 0 ? (
+            <Card>
+              <EmptyState
+                title="No firms created yet"
+                description="Create your first firm to start onboarding clients, users, and operational dashboards."
+                actionLabel="Create first firm"
+                onAction={() => navigate('/app/superadmin/firms')}
+                icon
+              />
+            </Card>
+          ) : null}
+
+          <Card className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold text-gray-900 tracking-tight">Firm Management</h2>
+              <Badge>Platform Admin</Badge>
+            </div>
+            <p className="text-sm text-gray-500">
+              Create new firms, activate or deactivate existing ones, and manage firm administrators.
+            </p>
+            <div>
+              <Button variant="primary" onClick={() => navigate('/app/superadmin/firms')}>
+                Go to Firms Management
+              </Button>
+            </div>
+          </Card>
+
+          <Card className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold text-gray-900 tracking-tight">Onboarding Observability</h2>
+              <Badge>Superadmin</Badge>
+            </div>
+            <div className="flex justify-end">
+              <div className="flex gap-2">
+                <Button variant="secondary" onClick={() => navigate('/app/superadmin/onboarding-insights')}>
+                  Open actionable insights
+                </Button>
+                <Button variant="ghost" onClick={() => navigate('/app/superadmin/diagnostics')}>
+                  Open support diagnostics
+                </Button>
+              </div>
+            </div>
+            {onboardingInsights ? (
+              <div className="space-y-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                  <MetricCard title="Zero Active Clients" value={onboardingInsights?.firmOverview?.firmsWithZeroActiveClients || 0} subtitle="Firms needing first client setup" />
+                  <MetricCard title="Missing Category/Workbasket" value={onboardingInsights?.firmOverview?.firmsWithoutCategoryOrWorkbasket || 0} subtitle="Firms blocked on workflow setup" />
+                  <MetricCard title="Managers w/o Queue" value={onboardingInsights?.blockers?.managersWithoutAssignedQueues || 0} subtitle="Managers not yet assigned to primary queues" />
+                  <MetricCard title="Users w/o Dockets" value={onboardingInsights?.blockers?.usersWithoutAssignedDockets || 0} subtitle="Users without assigned dockets" />
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                  <p><strong>Tutorial completed:</strong> {onboardingInsights?.tutorialFunnel?.completed || 0}</p>
+                  <p><strong>Tutorial skipped:</strong> {onboardingInsights?.tutorialFunnel?.skipped || 0}</p>
+                  <p><strong>Skipped + still incomplete (&gt;{onboardingInsights?.timeframe?.staleAfterDays || 3} days):</strong> {onboardingInsights?.tutorialFunnel?.skippedStillIncompleteAfterThreshold || 0}</p>
+                </div>
+                <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm text-slate-700">
+                  <p className="font-semibold text-slate-900">Proactive alerts</p>
+                  {!onboardingAlerts.length ? (
+                    <p className="text-xs text-slate-600 mt-1">No onboarding alerts currently need attention.</p>
+                  ) : (
+                    <ul className="mt-2 space-y-1 text-xs">
+                      {onboardingAlerts.map((alert) => (
+                        <li key={alert.id} className="flex items-center justify-between gap-2">
+                          <span>{alert.severity} • {alert.affected?.firmName}: {String(alert.blockerType || '').replace(/_/g, ' ')}</span>
+                          <Button variant="ghost" onClick={() => navigate(alert.links?.onboardingDetail || '/app/superadmin/onboarding-insights')}>Open</Button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <p className="text-sm text-gray-500">Onboarding insights are not available yet.</p>
+            )}
+          </Card>
+
+          <Card className="space-y-4">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-lg font-semibold text-gray-900 tracking-tight">Product Updates</h2>
+              <Badge>What&apos;s New</Badge>
+            </div>
+            <p className="text-sm text-gray-500">
+              Publish the latest release note shown to users on their next login.
+            </p>
+            <form className="space-y-3" onSubmit={handleCreateUpdate}>
+              <input
+                value={updateForm.title}
+                onChange={(event) => setUpdateForm((prev) => ({ ...prev, title: event.target.value }))}
+                placeholder="Update title"
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                maxLength={160}
+              />
+              <input
+                value={updateForm.version}
+                onChange={(event) => setUpdateForm((prev) => ({ ...prev, version: event.target.value }))}
+                placeholder={`Version (optional, e.g. v${APP_VERSION})`}
+                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                maxLength={32}
+              />
+              {updateForm.bullets.map((bullet, index) => (
+                <div key={index} className="flex items-center gap-2">
+                  <input
+                    value={bullet}
+                    onChange={(event) => handleBulletChange(index, event.target.value)}
+                    placeholder={`Bullet point ${index + 1}`}
+                    className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm"
+                    maxLength={180}
+                  />
+                  {updateForm.bullets.length > 1 ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      onClick={() => handleRemoveBullet(index)}
+                    >
+                      Remove
+                    </Button>
+                  ) : null}
+                </div>
+              ))}
+              <div>
+                <Button type="button" variant="secondary" onClick={handleAddBullet}>
+                  Add bullet point
+                </Button>
+                <p className="mt-1 text-xs text-gray-500">
+                  Up to {MAX_UPDATE_BULLETS} bullet points.
+                </p>
+              </div>
+              <label className="flex items-center gap-2 text-sm text-gray-700">
+                <input
+                  type="checkbox"
+                  checked={updateForm.isPublished}
+                  onChange={(event) => setUpdateForm((prev) => ({ ...prev, isPublished: event.target.checked }))}
+                />
+                Publish immediately
+              </label>
+              <Button type="submit" variant="primary" disabled={publishingUpdate}>
+                {publishingUpdate ? 'Publishing…' : 'Publish update'}
+              </Button>
+            </form>
+          </Card>
+      </div>
+    </SuperAdminLayout>
+  );
+};

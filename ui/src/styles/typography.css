@@ -1,0 +1,37 @@
+.type-hero {
+  font-size: 3rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.1;
+  margin-bottom: var(--space-md);
+}
+
+.type-section {
+  font-size: 1.875rem;
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.2;
+  margin-bottom: var(--space-md);
+}
+
+.type-card-title {
+  font-size: 1.125rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  line-height: 1.35;
+}
+
+.type-body {
+  color: var(--text-body);
+  font-size: var(--font-size-md);
+  font-weight: 400;
+  line-height: 1.6;
+}
+
+.type-body--medium {
+  font-weight: 500;
+}
+
+.type-body--semibold {
+  font-weight: 600;
+}

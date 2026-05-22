@@ -1,0 +1,233 @@
+/**
+ * Reports Dashboard Page
+ * MIS Dashboard with metric cards
+ */
+
+import React from 'react';
+import { useNavigate, useParams } from 'react-router-dom';
+import { EmptyState } from '../../components/ui/EmptyState';
+import { DashboardSkeleton } from '../../components/common/Skeleton';
+import { PlatformShell } from '../../components/platform/PlatformShell';
+import { MetricCard } from '../../components/reports/MetricCard';
+import { AuditLogView } from '../../components/reports/AuditLogView';
+import { useReportsDashboardQuery, getErrorMessage } from '../../hooks/useReportsDashboardQuery';
+import './ReportsDashboard.css';
+
+export const ReportsDashboard = () => {
+  const navigate = useNavigate();
+  const { firmSlug } = useParams();
+  const {
+    data,
+    error,
+    isLoading,
+    isFetching,
+    isSuccess,
+    refetch,
+  } = useReportsDashboardQuery();
+  const metrics = data?.metrics ?? null;
+  const pendingReport = data?.pendingReport ?? null;
+  const slaWeeklySummary = data?.slaWeeklySummary ?? null;
+  const hasAnyReportData = (
+    (metrics && Object.keys(metrics).length > 0) ||
+    (pendingReport && Object.keys(pendingReport).length > 0) ||
+    (slaWeeklySummary && Object.keys(slaWeeklySummary).length > 0)
+  );
+
+  const handleViewDetailedReports = () => {
+    navigate(`/app/firm/${firmSlug}/admin/reports/detailed`);
+  };
+
+  if (isLoading) {
+    return (
+      <PlatformShell
+        moduleLabel="Operations"
+        title="Reports & MIS dashboard"
+        subtitle="Management information system - read-only view."
+      >
+        <DashboardSkeleton />
+      </PlatformShell>
+    );
+  }
+
+  if (error && !isSuccess) {
+    return (
+      <PlatformShell
+        moduleLabel="Operations"
+        title="Reports & MIS dashboard"
+        subtitle="Management information system - read-only view."
+      >
+        <div className="reports-dashboard">
+          <EmptyState
+            title="We couldn’t load your reports"
+            description={getErrorMessage(error)}
+            actionLabel="Try again"
+            onAction={refetch}
+          />
+        </div>
+      </PlatformShell>
+    );
+  }
+
+  if (isSuccess && !hasAnyReportData) {
+    return (
+      <PlatformShell
+        moduleLabel="Operations"
+        title="Reports & MIS dashboard"
+        subtitle="Management information system - read-only view."
+      >
+        <div className="reports-dashboard">
+          <EmptyState
+            title="No reports available yet"
+            description="Once dockets and team activity start flowing, your reporting workspace will populate automatically."
+            actionLabel="Review docket registry"
+            onAction={() => navigate(`/app/firm/${firmSlug}/dockets`)}
+          />
+        </div>
+      </PlatformShell>
+    );
+  }
+
+  return (
+    <PlatformShell
+      moduleLabel="Operations"
+      title="Reports & MIS dashboard"
+      subtitle="Management information system - read-only view."
+    >
+      <div className="reports-dashboard">
+        {isFetching && hasAnyReportData ? <p className="text-sm text-gray-500">Refreshing report metrics…</p> : null}
+        <div className="reports-dashboard__grid">
+          {/* Total dockets card */}
+          <MetricCard
+            title="Total dockets"
+            value={metrics?.totalCases || 0}
+            subtitle={`Open: ${metrics?.byStatus?.Open || 0} | Pending: ${metrics?.byStatus?.Pending || 0} | Closed: ${metrics?.byStatus?.Closed || 0}`}
+            onClick={handleViewDetailedReports}
+          />
+
+          {/* Pending dockets card */}
+          <MetricCard
+            title="Pending dockets"
+            value={pendingReport?.totalPending || 0}
+            subtitle={`Critical: ${pendingReport?.byAgeing?.['30+ days'] || 0} overdue`}
+            warning={pendingReport?.byAgeing?.['30+ days'] > 0}
+            onClick={handleViewDetailedReports}
+          />
+
+          <MetricCard
+            title="Weekly SLA Summary"
+            value={slaWeeklySummary?.currentlyOverdue || 0}
+            subtitle={`Due soon: ${slaWeeklySummary?.dueSoon || 0} | Within SLA: ${slaWeeklySummary?.resolvedWithinSla || 0}`}
+            warning={(slaWeeklySummary?.currentlyOverdue || 0) > 0 || (slaWeeklySummary?.resolvedAfterBreach || 0) > 0}
+            onClick={handleViewDetailedReports}
+          />
+
+          {/* Top Categories Card */}
+          <div className="reports-dashboard__card">
+            <h3>Top Categories</h3>
+            {metrics?.byCategory && Object.keys(metrics.byCategory).length > 0 ? (
+              <table className="reports-dashboard__table">
+                <tbody>
+                  {Object.entries(metrics.byCategory)
+                    .slice(0, 5)
+                    .map(([category, count]) => (
+                      <tr key={category}>
+                        <td>{category}</td>
+                        <td className="reports-dashboard__count">{count}</td>
+                      </tr>
+                    ))}
+                </tbody>
+              </table>
+            ) : (
+              <EmptyState
+                title="No category data"
+                description="Category trends will appear when dockets are categorized."
+              />
+            )}
+          </div>
+
+          {/* Top Clients Card */}
+          <div className="reports-dashboard__card">
+            <h3>Top Clients</h3>
+            {metrics?.byClient && metrics.byClient.length > 0 ? (
+              <table className="reports-dashboard__table">
+                <tbody>
+                  {metrics.byClient.slice(0, 5).map((client) => (
+                    <tr key={client.clientId}>
+                      <td>{client.clientName}</td>
+                      <td className="reports-dashboard__count">{client.count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <EmptyState
+                title="No client data"
+                description="Client leaderboard data will appear once dockets are active."
+              />
+            )}
+          </div>
+
+          {/* Ageing breakdown card */}
+          <div className="reports-dashboard__card">
+            <h3>Pending dockets ageing</h3>
+            {pendingReport?.byAgeing ? (
+              <table className="reports-dashboard__table">
+                <tbody>
+                  <tr>
+                    <td>0-7 days</td>
+                    <td className="reports-dashboard__count">{pendingReport.byAgeing['0-7 days'] || 0}</td>
+                  </tr>
+                  <tr>
+                    <td>8-30 days</td>
+                    <td className="reports-dashboard__count">{pendingReport.byAgeing['8-30 days'] || 0}</td>
+                  </tr>
+                  <tr>
+                    <td>30+ days</td>
+                    <td className="reports-dashboard__count reports-dashboard__count--warning">
+                      {pendingReport.byAgeing['30+ days'] || 0}
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            ) : (
+              <EmptyState
+                title="No ageing data"
+                description="Pending ageing insights will appear when pending dockets exist."
+              />
+            )}
+          </div>
+
+          {/* Top employees card */}
+          <div className="reports-dashboard__card">
+            <h3>Top employees by dockets</h3>
+            {metrics?.byEmployee && metrics.byEmployee.length > 0 ? (
+              <table className="reports-dashboard__table">
+                <tbody>
+                  {metrics.byEmployee.slice(0, 5).map((employee) => (
+                    <tr key={employee.email}>
+                      <td>{employee.name}</td>
+                      <td className="reports-dashboard__count">{employee.count}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <EmptyState
+                title="No employee data"
+                description="Team workload data will appear as team members process dockets."
+              />
+            )}
+          </div>
+
+          <AuditLogView />
+        </div>
+
+        <div className="reports-dashboard__actions">
+          <button className="neo-button neo-button--primary" onClick={handleViewDetailedReports}>
+            View Detailed Reports
+          </button>
+        </div>
+      </div>
+    </PlatformShell>
+  );
+};

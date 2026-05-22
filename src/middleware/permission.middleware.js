@@ -1,0 +1,233 @@
+const User = require('../models/User.model');
+const { resolveRequestFirmRole, resolveFirmRole } = require('../services/authorization.service');
+const { isSuperAdminRole } = require('../utils/role.utils');
+const { requireAdmin: centralizedRequireAdmin } = require('./authorization.middleware');
+const log = require('../utils/log');
+
+/**
+ * Permission Middleware for Docketra Case Management System
+ * 
+ * Role-based access control for admin-only and superadmin-only operations
+ */
+
+/**
+ * Require Admin role
+ * Must be used after authenticate middleware
+ * 
+ * @deprecated Use policy-based authorization instead: authorize(AdminPolicy.isAdmin)
+ * This middleware is kept for backward compatibility but should be replaced
+ * with declarative policy guards in new code.
+ */
+const requireAdmin = centralizedRequireAdmin;
+
+/**
+ * Require Superadmin role
+ * Must be used after authenticate middleware
+ * Superadmin has platform-level access, no firmId
+ * 
+ * @deprecated Use policy-based authorization instead: authorize(SuperAdminPolicy.isSuperAdmin)
+ * This middleware is kept for backward compatibility but should be replaced
+ * with declarative policy guards in new code.
+ */
+const requireSuperadmin = async (req, res, next) => {
+  try {
+    if (!req.user || !isSuperAdminRole(req.user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Superadmin access required',
+      });
+    }
+    
+    next();
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error checking permissions',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Block Superadmin from accessing firm data routes
+ * Must be used after authenticate middleware
+ * Returns 403 if user is SuperAdmin
+ */
+const blockSuperadmin = async (req, res, next) => {
+  try {
+    if (req.user && isSuperAdminRole(req.user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Superadmin cannot access firm data',
+      });
+    }
+    
+    next();
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error checking permissions',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * PART 6: Require Firm Context (Defensive Assertion)
+ * Ensures non-SuperAdmin users have firmId
+ * Must be used after authenticate middleware
+ * This is a fail-fast guard to protect against future route refactors
+ */
+const requireFirmContext = async (req, res, next) => {
+  try {
+    // SuperAdmin doesn't have firmId - that's expected
+    if (req.user && isSuperAdminRole(req.user.role)) {
+      return next();
+    }
+    
+    // All other users MUST have firmId
+    if (!req.user || !req.user.firmId) {
+      log.error('[PERMISSION] Firm context missing for non-SuperAdmin user', {
+        xID: req.user?.xID || 'unknown',
+        role: req.user?.role || 'unknown',
+        path: req.path,
+      });
+      
+      return res.status(500).json({
+        success: false,
+        message: 'Firm context missing. Please contact administrator.',
+      });
+    }
+    
+    next();
+  } catch (error) {
+    log.error('[PERMISSION] Error checking firm context:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error checking permissions',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Legacy RBAC layer (firm capability guard).
+ *
+ * NOTE: keep for backward compatibility while newer routes use requireRole()
+ * for direct role checks. This guard continues to enforce firm capability checks.
+ */
+const authorizeFirmPermission = (requiredPermission) => {
+  const requiredPermissions = Array.isArray(requiredPermission) ? requiredPermission : [requiredPermission];
+  const normalizedRequiredPermissions = requiredPermissions
+    .filter((permission) => typeof permission === 'string' && permission.trim())
+    .map((permission) => permission.trim().toUpperCase());
+  const deniedMessage = normalizedRequiredPermissions.includes('CLIENT_MANAGE')
+    ? 'Client management requires Admin access.'
+    : 'Insufficient firm permissions';
+
+  return async (req, res, next) => {
+    try {
+      if (req.user && isSuperAdminRole(req.user.role)) {
+        return res.status(403).json({
+          success: false,
+          message: 'Superadmin cannot access firm-scoped permissions',
+        });
+      }
+
+      if (!req.firm || !req.firm.id) {
+        return res.status(400).json({
+          success: false,
+          message: 'Firm context is required for this operation',
+        });
+      }
+
+      let membership = await resolveRequestFirmRole(req, req.firm.id);
+
+      if (!membership) {
+        return res.status(403).json({
+          success: false,
+          message: 'You are not authorized for this firm',
+        });
+      }
+
+
+      const userId = req?.userId || req?.user?._id || req?.user?.id || req?.jwt?.userId || null;
+      if (userId) {
+        const freshMembership = await resolveFirmRole(userId, req.firm.id);
+        if (freshMembership) {
+          membership = freshMembership;
+        }
+      }
+
+      if (
+        normalizedRequiredPermissions.length > 0
+        && !normalizedRequiredPermissions.some((permission) => membership.permissions.includes(permission))
+      ) {
+        log.warn('[PERMISSION] Access denied by firm permission guard', {
+          requestId: req.requestId || req.id || req.headers?.['x-request-id'] || null,
+          userXID: req.user?.xID || null,
+          role: req.user?.role || null,
+          requiredPermission: normalizedRequiredPermissions,
+          firmId: req.firm?.id || req.firmId || req.user?.firmId || null,
+          path: req.originalUrl || req.path,
+          method: req.method,
+        });
+        return res.status(403).json({
+          success: false,
+          message: deniedMessage,
+        });
+      }
+
+      req.firmRole = membership.role;
+      req.firmPermissions = membership.permissions;
+      return next();
+    } catch (error) {
+      log.error('[PERMISSION] Firm permission check failed:', error);
+      return res.status(500).json({
+        success: false,
+        message: 'Error checking permissions',
+        error: error.message,
+      });
+    }
+  };
+};
+
+/**
+ * Require Platform SuperAdmin role
+ * Must be used after authenticate middleware
+ * Only PLATFORM_SUPERADMIN (SuperAdmin) can proceed; all others get 403
+ */
+const requirePlatformSuperAdmin = (req, res, next) => {
+  if (!req.user || !isSuperAdminRole(req.user.role)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Access denied.',
+    });
+  }
+  return next();
+};
+
+/**
+ * Require Firm User role (Admin or Employee)
+ * Must be used after authenticate middleware
+ * Explicitly denies PLATFORM_SUPERADMIN; only firm-scoped roles are allowed
+ */
+const requireFirmUser = (req, res, next) => {
+  if (!req.user || isSuperAdminRole(req.user.role)) {
+    return res.status(403).json({
+      success: false,
+      message: 'Firm access denied.',
+    });
+  }
+  return next();
+};
+
+module.exports = { 
+  requireAdmin, 
+  requireSuperadmin, 
+  blockSuperadmin,
+  requireFirmContext,
+  authorizeFirmPermission,
+  requirePlatformSuperAdmin,
+  requireFirmUser,
+};

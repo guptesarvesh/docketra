@@ -1,0 +1,2042 @@
+const User = require('../models/User.model');
+const Firm = require('../models/Firm.model');
+const Client = require('../models/Client.model');
+const SuperadminAudit = require('../models/SuperadminAudit.model');
+const AuthAudit = require('../models/AuthAudit.model');
+const { logAuthEvent } = require('../services/audit.service');
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+const jwt = require('jsonwebtoken');
+const emailService = require('../services/email.service');
+const mongoose = require('mongoose');
+const { generateNextClientId } = require('../services/clientIdGenerator');
+const { slugify, normalizeFirmSlug } = require('../utils/slugify');
+const { getDashboardSnapshot } = require('../utils/operationalMetrics');
+const wrapWriteHandler = require('../middleware/wrapWriteHandler');
+
+const { createFirmHierarchy, FirmBootstrapError } = require('../services/firmBootstrap.service');
+const { isFirmCreationDisabled } = require('../services/featureFlags.service');
+const xIDGenerator = require('../services/xIDGenerator');
+const { assertFirmPlanCapacity, PlanLimitExceededError, PlanAdminLimitExceededError } = require('../services/user.service');
+const { safeLogForensicAudit, getRequestIp, getRequestUserAgent, PLATFORM_TENANT } = require('../services/forensicAudit.service');
+const { createFirmWithAdmin } = require('../modules/onboarding/onboarding.service');
+const { safeAuditLog } = require('../services/safeSideEffects.service');
+const { getSession } = require('../utils/getSession');
+const log = require('../utils/log');
+const onboardingAnalyticsService = require('../services/onboardingAnalytics.service');
+const { getSupportDiagnosticsSnapshot } = require('../services/superadminDiagnostics.service');
+const { getFirmHealthSnapshot } = require('../services/superadminFirmHealth.service');
+const { buildPilotReadinessSnapshot } = require('../services/superadminPilotReadiness.service');
+const {
+  getFeatureFlagConfigByKey,
+  getFeatureFlagsSnapshot,
+  updateFeatureFlagState,
+  validateFirmIds,
+  PLATFORM_FEATURE_FLAGS_KEY,
+  SuperadminPlatformConfig,
+} = require('../services/featureFlags.service');
+const {
+  findFirmAdmin,
+  findFirmAdminById,
+  isAdminCurrentlyLocked,
+  normalizeAdminLifecycleStatus,
+  isAdminDisabledStatus,
+  resolveSessionQuery,
+  logSuperadminAction,
+  ADMIN_ROLE_VALUES,
+} = require('../services/superadminLifecycle.service');
+
+const getSuperadminFeatureFlags = async (req, res) => {
+  try {
+    const data = await getFeatureFlagsSnapshot();
+    return res.json({ success: true, data });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading feature flags snapshot:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load feature flags' });
+  }
+};
+
+const updateSuperadminFeatureFlag = async (req, res) => {
+  try {
+    const key = String(req.params?.key || '').trim();
+    const flag = getFeatureFlagConfigByKey(key);
+    if (!flag) {
+      return res.status(400).json({ success: false, message: 'Unknown feature flag key' });
+    }
+
+    const { enabledGlobally, rolloutStage, firmIds, notes } = req.body || {};
+    if (Array.isArray(firmIds) && !flag.allowFirmOverride && firmIds.length) {
+      return res.status(400).json({ success: false, message: `Firm overrides are not allowed for ${key}` });
+    }
+    const { ids: normalizedFirmIds, invalid } = validateFirmIds(firmIds);
+    if (invalid.length) {
+      return res.status(400).json({ success: false, message: 'Invalid firmIds provided', data: { invalidFirmIds: invalid } });
+    }
+    if (Array.isArray(firmIds) && normalizedFirmIds.length === 0) {
+      return res.status(400).json({ success: false, message: 'firmIds must contain at least one firm when provided.' });
+    }
+    if (Array.isArray(firmIds) && normalizedFirmIds.length > 0) {
+      const existingFirmRows = await Firm.find({ _id: { $in: normalizedFirmIds }, status: { $ne: 'deleted' } }).select('_id').lean();
+      const existing = new Set(existingFirmRows.map((row) => String(row._id)));
+      const missingFirmIds = normalizedFirmIds.filter((id) => !existing.has(id));
+      if (missingFirmIds.length) {
+        return res.status(400).json({ success: false, message: 'Some firmIds were not found', data: { missingFirmIds } });
+      }
+    }
+    const updateDoc = updateFeatureFlagState({ key, enabledGlobally, rolloutStage, firmIds });
+    const hasFirmOverridePayload = Array.isArray(firmIds);
+    if (Object.keys(updateDoc).length === 1 && !hasFirmOverridePayload) {
+      return res.status(400).json({ success: false, message: 'No editable fields provided' });
+    }
+    if (Object.keys(updateDoc).length > 1) {
+      await SuperadminPlatformConfig.updateOne(
+        { key: PLATFORM_FEATURE_FLAGS_KEY },
+        { $set: updateDoc, $setOnInsert: { key: PLATFORM_FEATURE_FLAGS_KEY } },
+        { upsert: true },
+      );
+    }
+    if (hasFirmOverridePayload) {
+      await Firm.updateMany({ _id: { $in: normalizedFirmIds }, status: { $ne: 'deleted' } }, {
+        $set: {
+          [`featureFlags.${key}.enabled`]: true,
+          [`featureFlags.${key}.updatedAt`]: new Date(),
+        },
+      });
+    }
+    await logSuperadminAction({
+      actionType: 'FeatureFlagUpdated',
+      description: `FeatureFlagUpdated:${key}`,
+      performedBy: req.user?.email || 'superadmin',
+      performedById: req.user?._id || null,
+      targetEntityType: 'Firm',
+      targetEntityId: String(key),
+      metadata: { key, enabledGlobally, rolloutStage, firmIdsCount: hasFirmOverridePayload ? normalizedFirmIds.length : undefined, notes: String(notes || '').slice(0, 500) },
+      req,
+    });
+    const data = await getFeatureFlagsSnapshot();
+    return res.json({ success: true, data });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error updating feature flag:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update feature flag' });
+  }
+};
+
+// Constants
+const FIRM_ID_PATTERN = /^FIRM\d{3,}$/i;
+const PASSWORD_SETUP_TOKEN_EXPIRY = '24h';
+
+
+/**
+ * Create a new firm with transactional guarantees
+ * POST /api/superadmin/firms
+ * 
+ * Atomically creates (ONE TRANSACTION):
+ * 1. Firm
+ * 2. Default Client (represents the firm, isSystemClient=true)
+ * 3. Default Admin User (assigned to firm and default client)
+ * 4. Links everything: Firm.defaultClientId, Admin.firmId, Admin.defaultClientId
+ * 
+ * If any step fails, all changes are rolled back.
+ * This ensures a firm never exists without its default client and admin.
+ * 
+ * Sends Tier-1 emails:
+ * - Firm Created SUCCESS to SuperAdmin
+ * - Default Admin Created to Admin email
+ * - Firm Creation FAILED to SuperAdmin (on error)
+ */
+const createFirm = async (req, res) => {
+  const result = await createFirmWithAdmin(req.body);
+  return {
+    success: true,
+    message: 'Firm onboarding started.',
+    data: {
+      firmId: result.firm._id,
+      adminId: result.admin._id,
+      firmStatus: result.firm.status,
+      adminStatus: result.admin.status,
+    },
+  };
+};
+
+/**
+ * Get platform-level statistics
+ * GET /api/superadmin/stats
+ */
+const getPlatformStats = async (req, res) => {
+  try {
+    const firmId = req.user?.firmId || null;
+    const firmFilter = firmId ? { _id: firmId } : {};
+    const firmScope = firmId ? { firmId } : {};
+
+    // PERFORMANCE: Execute independent queries concurrently
+    const [totalFirms, activeFirms, totalClients, totalUsers] = await Promise.all([
+      Firm.countDocuments(firmFilter),
+      Firm.countDocuments({ ...firmFilter, status: 'active' }),
+      Client.countDocuments(firmScope),
+      User.countDocuments({ ...firmScope, role: { $ne: 'SuperAdmin' } })
+    ]);
+    
+    res.json({
+      success: true,
+      data: {
+        totalFirms,
+        activeFirms,
+        inactiveFirms: totalFirms - activeFirms,
+        totalClients,
+        totalUsers,
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error getting platform stats:', error);
+    res.status(200).json({
+      success: false,
+      degraded: true,
+      message: 'Platform statistics unavailable; returning empty totals.',
+      data: {
+        totalFirms: 0,
+        activeFirms: 0,
+        inactiveFirms: 0,
+        totalClients: 0,
+        totalUsers: 0,
+      },
+    });
+  }
+};
+
+const getOnboardingInsights = async (req, res) => {
+  try {
+    const sinceDays = Number.parseInt(req.query?.sinceDays, 10) || 30;
+    const staleAfterDays = Number.parseInt(req.query?.staleAfterDays, 10) || 3;
+    const recentLimit = Number.parseInt(req.query?.recentLimit, 10) || 25;
+
+    const insights = await onboardingAnalyticsService.getOnboardingInsights({
+      sinceDays: Math.min(Math.max(sinceDays, 1), 120),
+      staleAfterDays: Math.min(Math.max(staleAfterDays, 1), 30),
+      recentLimit: Math.min(Math.max(recentLimit, 1), 100),
+    });
+
+    return res.json({ success: true, data: insights });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading onboarding insights:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to load onboarding insights',
+      data: null,
+    });
+  }
+};
+
+const getOnboardingInsightDetails = async (req, res) => {
+  try {
+    const sinceDays = Number.parseInt(req.query?.sinceDays, 10) || 30;
+    const staleAfterDays = Number.parseInt(req.query?.staleAfterDays, 10) || 7;
+    const completionState = String(req.query?.completionState || 'all').trim().toLowerCase();
+    const role = req.query?.role || null;
+    const blockerType = req.query?.blockerType || null;
+    const limit = Number.parseInt(req.query?.limit, 10) || 50;
+    const firmId = req.query?.firmId || null;
+
+    const details = await onboardingAnalyticsService.getOnboardingInsightDetails({
+      sinceDays: Math.min(Math.max(sinceDays, 7), 120),
+      staleAfterDays: Math.min(Math.max(staleAfterDays, 1), 60),
+      completionState: ['all', 'incomplete', 'completed', 'stale'].includes(completionState) ? completionState : 'all',
+      role,
+      blockerType,
+      limit: Math.min(Math.max(limit, 1), 100),
+      firmId,
+    });
+
+    return res.json({ success: true, data: details });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading onboarding insight details:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to load onboarding insight details',
+      data: null,
+    });
+  }
+};
+
+
+
+const getFirmHealth = async (req, res) => {
+  try {
+    const limit = Number.parseInt(req.query?.limit, 10) || 25;
+    const status = String(req.query?.status || '').trim().toLowerCase() || undefined;
+    const allowed = new Set(['healthy', 'watch', 'at_risk', 'critical']);
+
+    const snapshot = await getFirmHealthSnapshot({
+      limit,
+      status: allowed.has(status) ? status : undefined,
+      search: req.query?.search,
+    });
+
+    return res.json({ success: true, data: snapshot });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading firm health snapshot:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load firm health snapshot' });
+  }
+};
+
+const getSupportDiagnostics = async (req, res) => {
+  try {
+    const limit = Number.parseInt(req.query?.limit, 10) || 15;
+    const snapshot = await getSupportDiagnosticsSnapshot({
+      limit: Math.min(Math.max(limit, 5), 30),
+    });
+
+    return res.json({ success: true, data: snapshot });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading support diagnostics:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to load support diagnostics',
+    });
+  }
+};
+
+const REDACT_PATTERN = /(token|secret|password|otp|hash|credential|cookie|authorization|bearer|refresh|access)/i;
+const MAX_SEARCH_LENGTH = 100;
+
+const escapeRegex = (value) => String(value || '').trim().slice(0, MAX_SEARCH_LENGTH).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const buildSafeContainsRegex = (value) => {
+  const escaped = escapeRegex(value);
+  return escaped ? { $regex: escaped, $options: 'i' } : null;
+};
+
+const sanitizeDescription = (value) => {
+  const description = String(value || '');
+  if (!description) return '';
+  if (REDACT_PATTERN.test(description)) return '[REDACTED]';
+  return description.slice(0, 500);
+};
+
+const sanitizeAuditMetadata = (metadata = {}) => {
+  if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return {};
+  }
+
+  return Object.entries(metadata).reduce((acc, [key, value]) => {
+    if (REDACT_PATTERN.test(String(key))) {
+      acc[key] = '[REDACTED]';
+      return acc;
+    }
+    if (value == null || ['string', 'number', 'boolean'].includes(typeof value)) {
+      acc[key] = value;
+      return acc;
+    }
+    if (value instanceof Date) {
+      acc[key] = value.toISOString();
+      return acc;
+    }
+    if (Array.isArray(value)) {
+      acc[key] = `[${value.length} items]`;
+      return acc;
+    }
+    if (typeof value === 'object') {
+      acc[key] = '[OBJECT]';
+    }
+    return acc;
+  }, {});
+};
+
+const maskEmail = (email) => {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized || !normalized.includes('@')) return null;
+  const [local, domain] = normalized.split('@');
+  if (!local || !domain) return null;
+  const visible = local.length <= 2 ? local[0] : local.slice(0, 2);
+  return `${visible}***@${domain}`;
+};
+
+const parseSearchTypes = (value) => {
+  const allowed = new Set(['firms', 'admins', 'audit']);
+  const requested = String(value || '')
+    .split(',')
+    .map((entry) => entry.trim().toLowerCase())
+    .filter(Boolean)
+    .filter((entry) => allowed.has(entry));
+  return requested.length ? new Set(requested) : allowed;
+};
+
+const getSuperadminGlobalSearch = async (req, res) => {
+  try {
+    const trimmedQuery = String(req.query?.q || '').trim().slice(0, MAX_SEARCH_LENGTH);
+    const requestedLimit = Math.max(Number.parseInt(req.query?.limit, 10) || 10, 1);
+    const limit = Math.min(requestedLimit, 25);
+    const requestedTypes = parseSearchTypes(req.query?.types);
+    const searchRegex = buildSafeContainsRegex(trimmedQuery);
+
+    if (!searchRegex) {
+      return res.json({ success: true, data: { firms: [], admins: [], audit: [] } });
+    }
+
+    const result = { firms: [], admins: [], audit: [] };
+
+    if (requestedTypes.has('firms')) {
+      const firms = await Firm.find({
+        $or: [
+          { firmId: searchRegex },
+          { firmSlug: searchRegex },
+          { name: searchRegex },
+        ],
+      })
+        .select('_id firmId firmSlug name status')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean();
+
+      const firmObjectIds = firms.map((firm) => firm._id);
+      const admins = firmObjectIds.length
+        ? await User.find({
+          firmId: { $in: firmObjectIds },
+          isSystem: true,
+          role: { $in: ADMIN_ROLE_VALUES },
+          status: { $ne: 'deleted' },
+        }).select('firmId email').lean()
+        : [];
+      const adminByFirmId = new Map();
+      admins.forEach((admin) => {
+        const key = String(admin.firmId || '');
+        if (key && !adminByFirmId.has(key)) adminByFirmId.set(key, admin);
+      });
+
+      result.firms = firms.map((firm) => {
+        const admin = adminByFirmId.get(String(firm._id));
+        return {
+          type: 'firm',
+          id: firm._id,
+          firmId: firm.firmId,
+          firmSlug: firm.firmSlug,
+          name: firm.name,
+          status: firm.status,
+          adminEmailMasked: maskEmail(admin?.email),
+          href: `/app/superadmin/firms/${firm._id}`,
+        };
+      });
+    }
+
+    if (requestedTypes.has('admins')) {
+      const admins = await User.find({
+        isSystem: true,
+        role: { $in: ADMIN_ROLE_VALUES },
+        status: { $ne: 'deleted' },
+        $or: [{ xID: searchRegex }, { name: searchRegex }, { email: searchRegex }],
+      })
+        .select('_id firmId xID name email status')
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean();
+
+      const firmIds = [...new Set(admins.map((admin) => String(admin.firmId || '')).filter(Boolean))];
+      const firms = firmIds.length
+        ? await Firm.find({ _id: { $in: firmIds } }).select('_id firmId name').lean()
+        : [];
+      const firmMap = new Map(firms.map((firm) => [String(firm._id), firm]));
+
+      result.admins = admins.map((admin) => {
+        const firm = firmMap.get(String(admin.firmId || ''));
+        return {
+          type: 'admin',
+          id: admin._id,
+          firmId: firm?.firmId || null,
+          firmName: firm?.name || null,
+          xID: admin.xID || null,
+          name: admin.name || null,
+          emailMasked: maskEmail(admin.email),
+          status: admin.status || null,
+          href: firm ? `/app/superadmin/firms/${firm._id}` : '/app/superadmin/firms',
+        };
+      });
+    }
+
+    if (requestedTypes.has('audit')) {
+      const rows = await SuperadminAudit.find({
+        $or: [
+          { actionType: searchRegex },
+          { performedBy: searchRegex },
+          { targetEntityType: searchRegex },
+          { targetEntityId: searchRegex },
+          { 'metadata.firmId': searchRegex },
+          { 'metadata.firmName': searchRegex },
+          { 'metadata.requestId': searchRegex },
+        ],
+      })
+        .select('_id timestamp actionType performedBy targetEntityType targetEntityId metadata')
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .lean();
+
+      result.audit = rows.map((row) => {
+        const safeMetadata = sanitizeAuditMetadata(row.metadata || {});
+        const requestRef = safeMetadata.requestId || row.targetEntityId || '';
+        return {
+          type: 'audit',
+          id: row._id,
+          actionType: row.actionType,
+          performedBy: row.performedBy,
+          targetEntityType: row.targetEntityType || null,
+          targetEntityId: row.targetEntityId || null,
+          firmId: safeMetadata.firmId || null,
+          firmName: safeMetadata.firmName || safeMetadata.name || null,
+          requestId: safeMetadata.requestId || null,
+          timestamp: row.timestamp,
+          href: `/app/superadmin/audit?search=${encodeURIComponent(String(requestRef))}`,
+        };
+      });
+    }
+
+    return res.json({ success: true, data: result });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error executing global search:', error);
+    return res.status(500).json({ success: false, message: 'Failed to execute superadmin global search' });
+  }
+};
+
+const getSuperadminAuditLogs = async (req, res) => {
+  try {
+    const page = Math.max(Number.parseInt(req.query?.page, 10) || 1, 1);
+    const requestedLimit = Math.max(Number.parseInt(req.query?.limit, 10) || 25, 1);
+    const limit = Math.min(requestedLimit, 100);
+    const skip = (page - 1) * limit;
+
+    const filter = {};
+    if (req.query?.actionType) filter.actionType = req.query.actionType;
+    const actorRegex = buildSafeContainsRegex(req.query?.actor);
+    if (actorRegex) filter.performedBy = actorRegex;
+    if (req.query?.targetEntityType) filter.targetEntityType = req.query.targetEntityType;
+    const firmIdRegex = buildSafeContainsRegex(req.query?.firmId);
+    if (firmIdRegex) filter['metadata.firmId'] = firmIdRegex;
+
+    const from = req.query?.from ? new Date(req.query.from) : null;
+    const to = req.query?.to ? new Date(req.query.to) : null;
+    if ((from && !Number.isNaN(from.getTime())) || (to && !Number.isNaN(to.getTime()))) {
+      filter.timestamp = {};
+      if (from && !Number.isNaN(from.getTime())) filter.timestamp.$gte = from;
+      if (to && !Number.isNaN(to.getTime())) filter.timestamp.$lte = to;
+    }
+
+    const searchRegex = buildSafeContainsRegex(req.query?.search);
+    if (searchRegex) {
+      filter.$or = [
+        { actionType: searchRegex },
+        { description: searchRegex },
+        { performedBy: searchRegex },
+        { targetEntityType: searchRegex },
+        { targetEntityId: searchRegex },
+        { 'metadata.firmId': searchRegex },
+        { 'metadata.firmName': searchRegex },
+        { 'metadata.requestId': searchRegex },
+      ];
+    }
+
+    const [rows, total] = await Promise.all([
+      SuperadminAudit.find(filter).sort({ timestamp: -1 }).skip(skip).limit(limit).lean(),
+      SuperadminAudit.countDocuments(filter),
+    ]);
+
+    const data = rows.map((row) => {
+      const safeMetadata = sanitizeAuditMetadata(row.metadata);
+      return {
+        _id: row._id,
+        timestamp: row.timestamp,
+        actionType: row.actionType,
+        description: sanitizeDescription(row.description),
+        performedBy: row.performedBy,
+        targetEntityType: row.targetEntityType || null,
+        targetEntityId: row.targetEntityId || null,
+        firmId: safeMetadata.firmId || null,
+        firmName: safeMetadata.firmName || safeMetadata.name || null,
+        requestId: safeMetadata.requestId || null,
+        ipAddress: row.ipAddress || null,
+        userAgent: row.userAgent || null,
+        metadata: safeMetadata,
+      };
+    });
+
+    return res.json({
+      success: true,
+      data,
+      pagination: {
+        page,
+        limit,
+        total,
+        hasMore: page * limit < total,
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading audit logs:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load superadmin audit logs' });
+  }
+};
+
+const getOnboardingAlerts = async (req, res) => {
+  try {
+    const sinceDays = Number.parseInt(req.query?.sinceDays, 10) || 30;
+    const staleAfterDays = Number.parseInt(req.query?.staleAfterDays, 10) || 7;
+    const severity = req.query?.severity || null;
+    const blockerType = req.query?.blockerType || null;
+    const ageBucket = req.query?.ageBucket || null;
+    const status = req.query?.status || 'open';
+    const limit = Number.parseInt(req.query?.limit, 10) || 50;
+
+    const alerts = await onboardingAnalyticsService.getOnboardingAlerts({
+      sinceDays: Math.min(Math.max(sinceDays, 7), 120),
+      staleAfterDays: Math.min(Math.max(staleAfterDays, 1), 60),
+      severity,
+      blockerType,
+      ageBucket,
+      status,
+      limit: Math.min(Math.max(limit, 1), 100),
+    });
+
+    return res.json({ success: true, data: alerts });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading onboarding alerts:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to load onboarding alerts',
+      data: null,
+    });
+  }
+};
+
+/**
+ * List all firms with client and user counts
+ * GET /api/superadmin/firms
+ */
+const listFirms = async (req, res) => {
+  try {
+    const firms = await Firm.find()
+      .select('firmId firmSlug name status createdAt plan maxUsers subscriptionStatus billingStatus billingOwnerId')
+      .sort({ createdAt: -1 });
+    const firmIds = firms.map((firm) => firm._id);
+
+    const [clientCounts, userCounts, admins] = await Promise.all([
+      Client.aggregate([
+        { $match: { firmId: { $in: firmIds } } },
+        { $group: { _id: '$firmId', count: { $sum: 1 } } },
+      ]),
+      User.aggregate([
+        { $match: { firmId: { $in: firmIds }, status: { $ne: 'deleted' } } },
+        { $group: { _id: '$firmId', count: { $sum: 1 } } },
+      ]),
+      User.find({
+        firmId: { $in: firmIds },
+        isSystem: true,
+        role: { $in: ADMIN_ROLE_VALUES },
+        status: { $ne: 'deleted' },
+      })
+        .select('firmId email emailVerified emailVerifiedAt verificationMethod termsAccepted termsAcceptedAt termsVersion signupIP signupUserAgent')
+        .lean(),
+    ]);
+
+    const clientCountMap = new Map(clientCounts.map((entry) => [String(entry._id), entry.count]));
+    const userCountMap = new Map(userCounts.map((entry) => [String(entry._id), entry.count]));
+    const adminMap = new Map();
+    for (const admin of admins) {
+      const key = String(admin.firmId);
+      if (!adminMap.has(key)) {
+        adminMap.set(key, admin);
+      }
+    }
+
+    const firmsWithCounts = firms.map((firm) => {
+      const firmKey = String(firm._id);
+      const admin = adminMap.get(firmKey);
+      return {
+        _id: firm._id,
+        firmId: firm.firmId,
+        firmSlug: firm.firmSlug,
+        name: firm.name,
+        status: firm.status,
+        isActive: firm.status === 'active',
+        clientCount: clientCountMap.get(firmKey) || 0,
+        userCount: userCountMap.get(firmKey) || 0,
+        adminEmail: admin?.email || null,
+        emailVerified: typeof admin?.emailVerified === 'boolean' ? admin.emailVerified : null,
+        emailVerifiedAt: admin?.emailVerifiedAt || null,
+        verificationMethod: admin?.verificationMethod || null,
+        termsAccepted: typeof admin?.termsAccepted === 'boolean' ? admin.termsAccepted : null,
+        termsAcceptedAt: admin?.termsAcceptedAt || null,
+        termsVersion: admin?.termsVersion || null,
+        signupIP: admin?.signupIP || null,
+        signupUserAgent: admin?.signupUserAgent || null,
+        createdAt: firm.createdAt,
+      };
+    });
+    
+    res.json({
+      success: true,
+      data: firmsWithCounts,
+      count: firmsWithCounts.length,
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error listing firms:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to list firms',
+    });
+  }
+};
+
+/**
+ * Update firm status (activate/suspend)
+ * PATCH /api/superadmin/firms/:id
+ */
+const updateFirmStatus = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    
+    if (!status || !['active', 'suspended'].includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Status must be ACTIVE or SUSPENDED',
+      });
+    }
+    
+    const firm = await Firm.findById(id);
+    
+    if (!firm) {
+      return res.status(404).json({
+        success: false,
+        code: 'FIRM_NOT_FOUND',
+        message: 'Firm not found',
+      });
+    }
+    
+    const oldStatus = firm.status;
+    firm.status = status;
+    await firm.save();
+    
+    // Log action
+    const actionType = status === 'active' ? 'FirmActivated' : 'FirmSuspended';
+    await logSuperadminAction({
+      actionType,
+      description: `Firm ${status === 'active' ? 'activated' : 'suspended'}: ${firm.name} (${firm.firmId})`,
+      performedBy: req.user.email,
+      performedById: req.user._id,
+      targetEntityType: 'Firm',
+      targetEntityId: firm._id.toString(),
+      metadata: { firmId: firm.firmId, name: firm.name, oldStatus, newStatus: status },
+      req,
+    });
+    
+    res.json({
+      success: true,
+      message: `Firm ${status === 'active' ? 'activated' : 'suspended'} successfully`,
+      data: {
+        _id: firm._id,
+        firmId: firm.firmId,
+        name: firm.name,
+        status: firm.status,
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error updating firm status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update firm status',
+    });
+  }
+};
+
+/**
+ * Disable firm immediately (single action)
+ * POST /api/superadmin/firms/:id/disable
+ */
+const disableFirmImmediately = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const firm = await Firm.findById(id);
+
+    if (!firm) {
+      return res.status(404).json({
+        success: false,
+        message: 'Firm not found',
+      });
+    }
+
+    const oldStatus = firm.status;
+    firm.status = 'suspended';
+    await firm.save();
+
+    await logSuperadminAction({
+      actionType: 'FirmSuspended',
+      description: `Firm disabled immediately: ${firm.name} (${firm.firmId})`,
+      performedBy: req.user.email,
+      performedById: req.user._id,
+      targetEntityType: 'Firm',
+      targetEntityId: firm._id.toString(),
+      metadata: { firmId: firm.firmId, name: firm.name, oldStatus, newStatus: 'suspended' },
+      req,
+    });
+
+    return res.json({
+      success: true,
+      message: 'Firm disabled immediately',
+      data: {
+        _id: firm._id,
+        firmId: firm.firmId,
+        name: firm.name,
+        status: firm.status,
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error disabling firm immediately:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to disable firm',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Create firm admin
+ * POST /api/superadmin/firms/:firmId/admin
+ * 
+ * Creates an Admin user for a firm with proper hierarchy:
+ * - firmId: Links to the firm
+ * - defaultClientId: Links to the firm's default client
+ * 
+ * The admin's defaultClientId MUST match the firm's defaultClientId.
+ */
+const createFirmAdmin = async (req, res) => {
+  try {
+    const { firmId } = req.params;
+    const { name, email } = req.body;
+    
+    // Validate required fields
+    if (!name || !email) {
+      return res.status(400).json({
+        success: false,
+        message: 'Name and email are required',
+      });
+    }
+
+    const normalizedEmail = email.trim().toLowerCase();
+    
+    // Find firm by MongoDB _id and populate defaultClientId
+    const firm = await Firm.findById(firmId);
+    
+    if (!firm) {
+      return res.status(404).json({
+        success: false,
+        message: 'Firm not found',
+      });
+    }
+    
+    // Ensure firm has a defaultClientId
+    if (!firm.defaultClientId) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firm does not have a default client. Cannot create admin.',
+      });
+    }
+    
+    // Check if user with this email already exists within firm
+    const existingEmail = await User.findOne({
+      firmId: firm._id,
+      email: normalizedEmail,
+      status: { $ne: 'deleted' },
+    });
+    if (existingEmail) {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin with this email already exists for this firm',
+      });
+    }
+
+    await assertFirmPlanCapacity({ firmId: firm._id, role: 'Admin' });
+
+    const normalizedXID = await xIDGenerator.generateNextXID(firm._id);
+    
+    const passwordSetupSecret = process.env.JWT_PASSWORD_SETUP_SECRET;
+    if (!passwordSetupSecret) {
+      return res.status(500).json({
+        success: false,
+        message: 'JWT_PASSWORD_SETUP_SECRET environment variable is not configured',
+      });
+    }
+    
+    // Create admin user with firmId and defaultClientId
+    const adminUser = new User({
+      xID: normalizedXID,
+      name,
+      email: normalizedEmail,
+      firmId: firm._id,
+      defaultClientId: firm.defaultClientId, // Set to firm's default client
+      role: 'Admin',
+      status: 'invited',
+      isActive: true,
+      passwordSet: false,
+      mustSetPassword: false,
+      mustChangePassword: true,
+      inviteSentAt: new Date(),
+      passwordSetAt: null,
+    });
+    
+    await adminUser.save();
+    
+    // Send password setup email
+    try {
+      const setupToken = jwt.sign(
+        {
+          userId: adminUser._id,
+          firmId: firm._id,
+          type: 'PASSWORD_SETUP',
+        },
+        passwordSetupSecret,
+        { expiresIn: PASSWORD_SETUP_TOKEN_EXPIRY }
+      );
+
+      const emailResult = await emailService.sendPasswordSetupEmail({
+        email: adminUser.email,
+        name: adminUser.name,
+        token: setupToken,
+        xID: normalizedXID,
+        firmSlug: firm.firmSlug, // Pass firmSlug for firm-specific URL in email
+        role: adminUser.role,
+        req,
+      });
+      if (!emailResult.success) {
+        log.warn('[SUPERADMIN] Password setup email not sent:', emailResult.error);
+      }
+    } catch (emailError) {
+      log.warn('[SUPERADMIN] Failed to send password setup email:', emailError.message);
+      // Don't fail the request - admin was created successfully
+    }
+    
+    // Log action
+    await logSuperadminAction({
+      actionType: 'AdminCreated',
+      description: `Firm admin created: ${name} (${normalizedXID}) for firm ${firm.name} (${firm.firmId})`,
+      performedBy: req.user.email,
+      performedById: req.user._id,
+      targetEntityType: 'User',
+      targetEntityId: adminUser._id.toString(),
+      metadata: { firmId: firm.firmId, firmName: firm.name, adminXID: normalizedXID, adminEmail: normalizedEmail },
+      req,
+    });
+    
+    res.status(201).json({
+      success: true,
+      message: 'Firm admin created successfully',
+      data: {
+        _id: adminUser._id,
+        xID: adminUser.xID,
+        name: adminUser.name,
+        email: adminUser.email,
+        role: adminUser.role,
+        status: adminUser.status,
+        firm: {
+          _id: firm._id,
+          firmId: firm.firmId,
+          name: firm.name,
+        },
+      },
+    });
+  } catch (error) {
+    if (error instanceof PlanLimitExceededError || error instanceof PlanAdminLimitExceededError) {
+      return res.status(403).json({
+        success: false,
+        error: error.code,
+        message: error.message,
+      });
+    }
+    if (error?.code === 11000) {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin with this email already exists',
+      });
+    }
+    log.error('[SUPERADMIN] Error creating firm admin:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to create firm admin',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get firm metadata by slug (PUBLIC endpoint for login page)
+ * GET /api/public/firms/:firmSlug
+ */
+const getFirmBySlug = async (req, res) => {
+  try {
+    const { firmSlug } = req.params;
+    
+    if (!firmSlug) {
+      return res.status(400).json({
+        success: false,
+        message: 'Firm slug is required',
+      });
+    }
+    
+    const normalizedSlug = normalizeFirmSlug(firmSlug);
+    if (!normalizedSlug) {
+      return res.status(400).json({
+        success: false,
+        code: 'FIRM_RESOLUTION_FAILED',
+        message: 'Firm slug is required',
+      });
+    }
+    
+    const firm = await Firm.findOne({ firmSlug: normalizedSlug })
+      .select('firmId firmSlug name status');
+    
+    if (!firm) {
+      return res.status(404).json({
+        success: false,
+        message: 'Firm not found',
+      });
+    }
+    
+    res.json({
+      success: true,
+      data: {
+        firmId: firm.firmId,
+        firmSlug: firm.firmSlug,
+        name: firm.name,
+        status: firm.status,
+        isActive: firm.status === 'active',
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error getting firm by slug:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to get firm',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Operational health snapshot for pilot safety dashboard
+ * GET /api/superadmin/health
+ */
+const getOperationalHealth = async (req, res) => {
+  try {
+    if (!req.user || req.user.role !== 'SuperAdmin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden',
+      });
+    }
+    return res.json({
+      success: true,
+      data: {
+        timestamp: new Date().toISOString(),
+        firms: getDashboardSnapshot(),
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error generating operational health:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to generate health snapshot',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Switch SuperAdmin into a firm context (impersonation mode)
+ * POST /api/superadmin/switch-firm
+ * 
+ * Allows SuperAdmin to enter firm context for debugging, support, or setup.
+ * Does NOT mutate user identity or firm ownership.
+ * Attaches impersonatedFirmId to request context.
+ * 
+ * Supports two impersonation modes:
+ * - READ_ONLY (default): View data only, mutations blocked
+ * - FULL_ACCESS: Full access including write operations
+ */
+const switchFirm = async (req, res) => {
+  await safeLogForensicAudit({
+    tenantId: req.body?.firmId,
+    entityType: 'IMPERSONATION',
+    entityId: req.body?.sessionId || req.user?._id?.toString() || 'NO_SESSION',
+    action: 'IMPERSONATION_START',
+    performedBy: req.user?.xID || req.user?.email || 'SUPERADMIN',
+    performedByRole: req.user?.role || 'SuperAdmin',
+    impersonatedBy: req.user?.xID || req.user?._id?.toString() || null,
+    ipAddress: getRequestIp(req),
+    userAgent: getRequestUserAgent(req),
+    metadata: {
+      allowed: false,
+      reason: 'SuperAdmin firm impersonation is disabled by hard guard',
+      requestedFirmId: req.body?.firmId || null,
+    },
+  });
+
+  // Hard guard: SuperAdmin must never access firm-scoped data via impersonation
+  return res.status(403).json({
+    success: false,
+    message: 'SuperAdmin cannot access firm data.',
+  });
+};
+
+/**
+ * Exit firm context and return to GLOBAL scope
+ * POST /api/superadmin/exit-firm
+ * 
+ * Clears impersonation and returns SuperAdmin to GLOBAL context.
+ */
+const exitFirm = async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    
+    await safeLogForensicAudit({
+      tenantId: PLATFORM_TENANT,
+      entityType: 'IMPERSONATION',
+      entityId: sessionId || req.user?._id?.toString() || 'NO_SESSION',
+      action: 'IMPERSONATION_END',
+      performedBy: req.user?.xID || req.user?.email || 'SUPERADMIN',
+      performedByRole: req.user?.role || 'SuperAdmin',
+      impersonatedBy: req.user?.xID || req.user?._id?.toString() || null,
+      ipAddress: getRequestIp(req),
+      userAgent: getRequestUserAgent(req),
+      metadata: {
+        fromContext: 'FIRM',
+        toContext: 'GLOBAL',
+      },
+    });
+
+    // Log exit action with sessionId for audit trail linkage
+    await logSuperadminAction({
+      actionType: 'ExitFirm',
+      description: 'SuperAdmin exited firm context, returned to GLOBAL scope',
+      performedBy: req.user.email,
+      performedById: req.user._id,
+      targetEntityType: 'Firm',
+      targetEntityId: null,
+      metadata: {
+        fromContext: 'FIRM',
+        toContext: 'GLOBAL',
+        sessionId: sessionId || null,
+      },
+      req,
+    });
+    
+    res.json({
+      success: true,
+      message: 'Returned to GLOBAL context',
+      data: {
+        impersonatedFirmId: null,
+        scope: 'GLOBAL',
+      },
+    });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error exiting firm context:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to exit firm context',
+      error: error.message,
+    });
+  }
+};
+
+/**
+ * Get firm default admin details for SuperAdmin visibility
+ * GET /api/superadmin/firms/:firmId/admin
+ */
+const getFirmAdminDetails = async (req, res) => {
+  const { firmId } = req.params;
+
+  const firm = await Firm.findById(firmId).select('firmId name');
+  if (!firm) {
+    return res.status(404).json({
+      success: false,
+      code: 'FIRM_NOT_FOUND',
+      message: 'Firm not found',
+    });
+  }
+
+  const admin = await findFirmAdmin(firm._id);
+  if (!admin) {
+    return res.status(404).json({
+      success: false,
+      code: 'ADMIN_NOT_FOUND',
+      message: 'Default admin for this firm not found',
+    });
+  }
+
+  if (admin.status === 'deleted') {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_DELETED',
+      message: 'Cannot update a deleted admin',
+    });
+  }
+
+  let lastLoginAt = null;
+  try {
+    const lastLoginAudit = await AuthAudit.findOne({
+      userId: admin._id,
+      actionType: 'Login',
+    }).select('timestamp').sort({ timestamp: -1 });
+    lastLoginAt = lastLoginAudit?.timestamp || null;
+  } catch (error) {
+    log.warn('[SUPERADMIN] Failed to fetch admin last login audit:', error.message);
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: {
+      name: admin.name,
+      emailMasked: emailService.maskEmail(admin.email),
+      email: admin.email,
+      xID: admin.xID,
+      status: admin.status,
+      lastLoginAt,
+      passwordSetAt: admin.passwordSetAt || null,
+      inviteSentAt: admin.inviteSentAt || null,
+      failedLoginAttempts: admin.failedLoginAttempts || 0,
+      isLocked: isAdminCurrentlyLocked(admin),
+      emailVerified: typeof admin.emailVerified === 'boolean' ? admin.emailVerified : null,
+      emailVerifiedAt: admin.emailVerifiedAt || null,
+      verificationMethod: admin.verificationMethod || null,
+      termsAccepted: typeof admin.termsAccepted === 'boolean' ? admin.termsAccepted : null,
+      termsAcceptedAt: admin.termsAcceptedAt || null,
+      termsVersion: admin.termsVersion || null,
+      signupIP: admin.signupIP || null,
+      signupUserAgent: admin.signupUserAgent || null,
+    },
+  });
+};
+
+/**
+ * List firm admins for SuperAdmin visibility
+ * GET /api/superadmin/firms/:firmId/admins
+ */
+const listFirmAdmins = async (req, res) => {
+  const { firmId } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(firmId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Firm not found',
+    });
+  }
+
+  const firm = await Firm.findById(firmId).select('firmId name');
+  if (!firm) {
+    return res.status(404).json({
+      success: false,
+      code: 'FIRM_NOT_FOUND',
+      message: 'Firm not found',
+    });
+  }
+
+  const admins = await User.find({ firmId: firm._id, role: { $in: ADMIN_ROLE_VALUES }, status: { $ne: 'deleted' } })
+    .select('name email xID status isSystem lockUntil passwordSetAt inviteSentAt')
+    .sort({ isSystem: -1, createdAt: 1 });
+
+  const lastLoginAudits = await AuthAudit.find({
+    userId: { $in: admins.map((admin) => admin._id) },
+    actionType: 'Login',
+  })
+    .select('userId timestamp')
+    .sort({ timestamp: -1 });
+
+  const lastLoginMap = new Map();
+  for (const audit of lastLoginAudits) {
+    const key = String(audit.userId);
+    if (!lastLoginMap.has(key)) {
+      lastLoginMap.set(key, audit.timestamp);
+    }
+  }
+
+  return res.status(200).json({
+    success: true,
+    data: admins.map((admin) => ({
+      _id: admin._id,
+      name: admin.name,
+      emailMasked: emailService.maskEmail(admin.email),
+      xID: admin.xID,
+      status: admin.status,
+      isSystem: Boolean(admin.isSystem),
+      lastLoginAt: lastLoginMap.get(String(admin._id)) || null,
+      passwordSetAt: admin.passwordSetAt || null,
+      inviteSentAt: admin.inviteSentAt || null,
+      isLocked: isAdminCurrentlyLocked(admin),
+    })),
+  });
+};
+
+/**
+ * Update firm default admin status (ACTIVE / DISABLED)
+ * PATCH /api/superadmin/firms/:firmId/admin/status
+ */
+const updateFirmAdminStatus = async (req, res) => {
+  const { firmId } = req.params;
+  const targetAdminId = req.params.adminId;
+  const requestedStatus = req.body?.status;
+  const status = normalizeAdminLifecycleStatus(requestedStatus);
+  if (!mongoose.Types.ObjectId.isValid(firmId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Firm not found',
+    });
+  }
+  if (targetAdminId && !mongoose.Types.ObjectId.isValid(targetAdminId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Admin not found',
+    });
+  }
+
+  if (!status) {
+    return res.status(400).json({
+      success: false,
+      message: 'Status must be ACTIVE or DISABLED',
+    });
+  }
+
+  const firm = await Firm.findById(firmId).select('firmId name');
+  if (!firm) {
+    return res.status(404).json({
+      success: false,
+      code: 'FIRM_NOT_FOUND',
+      message: 'Firm not found',
+    });
+  }
+
+  const admin = targetAdminId
+    ? await findFirmAdminById(firm._id, targetAdminId)
+    : await findFirmAdmin(firm._id);
+  if (!admin) {
+    return res.status(404).json({
+      success: false,
+      code: 'ADMIN_NOT_FOUND',
+      message: 'Default admin for this firm not found',
+    });
+  }
+
+  if (admin.status === 'deleted') {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_DELETED',
+      message: 'Cannot update a deleted admin',
+    });
+  }
+
+  if (normalizeAdminLifecycleStatus(admin.status) === status) {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_STATUS_UNCHANGED',
+      message: `Admin is already ${status}`,
+    });
+  }
+
+  if (admin.status === 'invited' && status === 'disabled') {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_INVALID_STATUS_TRANSITION',
+      message: 'Cannot disable an invited admin before activation',
+    });
+  }
+
+  if (status === 'active' && (admin.mustChangePassword || admin.mustSetPassword)) {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_PASSWORD_NOT_SET',
+      message: 'Cannot activate admin before password is set',
+    });
+  }
+
+  const oldStatus = admin.status;
+  if (status === 'disabled' && normalizeAdminLifecycleStatus(admin.status) === 'active') {
+    const session = getSession(req);
+    const activeAdminsCountQuery = User.countDocuments({
+      firmId: firm._id,
+      role: { $in: ADMIN_ROLE_VALUES },
+      status: 'active',
+    });
+    const activeAdminsCount = await resolveSessionQuery(activeAdminsCountQuery, session);
+
+    if (activeAdminsCount <= 1) {
+      log.warn('[SUPERADMIN] Blocked disable: last active admin protection', {
+        firmId: firm.firmId,
+        adminXID: admin.xID,
+      });
+      const err = new Error('Cannot disable the last active admin for this firm');
+      err.statusCode = 422;
+      err.code = 'LAST_ACTIVE_ADMIN';
+      throw err;
+    }
+
+    const adminForUpdateQuery = User.findOne({
+      _id: admin._id,
+      firmId: firm._id,
+      role: { $in: ADMIN_ROLE_VALUES },
+      status: { $ne: 'deleted' },
+    });
+    const adminForUpdate = await resolveSessionQuery(adminForUpdateQuery, session);
+
+    if (!adminForUpdate) {
+      const err = new Error('Admin not found');
+      err.statusCode = 404;
+      err.code = 'ADMIN_NOT_FOUND';
+      throw err;
+    }
+
+    adminForUpdate.status = 'disabled';
+    adminForUpdate.isActive = false;
+    await adminForUpdate.save({ session });
+
+    admin.status = adminForUpdate.status;
+    admin.isActive = adminForUpdate.isActive;
+  } else {
+    admin.status = status;
+    admin.isActive = status === 'active';
+    await admin.save();
+  }
+
+  await logSuperadminAction({
+    actionType: 'AdminStatusChanged',
+    description: `Admin status changed for firm ${firm.name} (${firm.firmId}): ${admin.xID} ${oldStatus} → ${status}`,
+    performedBy: req.user.email,
+    performedById: req.user._id,
+    targetEntityType: 'User',
+    targetEntityId: admin._id.toString(),
+    metadata: {
+      firmId: firm.firmId,
+      firmName: firm.name,
+      adminXID: admin.xID,
+      oldStatus,
+        newStatus: status,
+      },
+      req,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: `Admin ${status === 'active' ? 'enabled' : 'disabled'} successfully`,
+    data: {
+      xID: admin.xID,
+      status: admin.status,
+      isActive: admin.isActive,
+    },
+  });
+};
+
+/**
+ * Force password reset for ACTIVE firm admin
+ * POST /api/superadmin/firms/:firmId/admin/force-reset
+ */
+const forceResetFirmAdmin = async (req, res) => {
+  const { firmId } = req.params;
+  const targetAdminId = req.params.adminId;
+  if (!mongoose.Types.ObjectId.isValid(firmId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Firm not found',
+    });
+  }
+  if (targetAdminId && !mongoose.Types.ObjectId.isValid(targetAdminId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Admin not found',
+    });
+  }
+
+  const firm = await Firm.findById(firmId);
+  if (!firm) {
+    return res.status(404).json({
+      success: false,
+      code: 'FIRM_NOT_FOUND',
+      message: 'Firm not found',
+    });
+  }
+
+  const admin = targetAdminId
+    ? await findFirmAdminById(firm._id, targetAdminId)
+    : await findFirmAdmin(firm._id);
+  if (!admin) {
+    return res.status(404).json({
+      success: false,
+      code: 'ADMIN_NOT_FOUND',
+      message: 'Default admin for this firm not found',
+    });
+  }
+
+  if (admin.status === 'deleted') {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_DELETED',
+      message: 'Cannot reset password for deleted admin',
+    });
+  }
+
+  if (admin.status !== 'active') {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_NOT_ACTIVE',
+      message: 'Force password reset is only available for ACTIVE admins',
+    });
+  }
+
+  const newToken = crypto.randomBytes(32).toString('hex');
+  const newTokenHash = crypto.createHash('sha256').update(newToken).digest('hex');
+  const tokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  admin.passwordSetupTokenHash = null;
+  admin.passwordSetupExpires = null;
+  admin.passwordResetTokenHash = null;
+  admin.passwordResetExpires = null;
+  admin.passwordResetTokenHash = newTokenHash;
+  admin.passwordResetExpires = tokenExpires;
+  admin.mustChangePassword = true;
+  // Deprecated flag retained for backward compatibility during rollout.
+  admin.forcePasswordReset = true;
+  await admin.save();
+
+  let emailSuccess = true;
+  try {
+    const emailResult = await emailService.sendAdminPasswordResetEmail({
+      email: admin.email,
+      name: admin.name,
+      token: newToken,
+      xID: admin.xID,
+      firmSlug: firm.firmSlug,
+      req,
+    });
+    if (emailResult && emailResult.success === false) {
+      emailSuccess = false;
+      log.warn('[SUPERADMIN] Admin force-reset email not sent:', emailResult.error);
+    }
+  } catch (emailError) {
+    emailSuccess = false;
+    log.warn('[SUPERADMIN] Failed to send admin force-reset email:', emailError.message);
+  }
+
+  await logSuperadminAction({
+    actionType: emailSuccess ? 'AdminForcePasswordReset' : 'AdminForcePasswordResetEmailFailed',
+    description: `Admin force password reset for firm ${firm.name} (${firm.firmId}), admin ${admin.xID}`,
+    performedBy: req.user.email,
+    performedById: req.user._id,
+    targetEntityType: 'User',
+    targetEntityId: admin._id.toString(),
+    metadata: {
+      firmId: firm.firmId,
+      firmName: firm.name,
+      adminXID: admin.xID,
+      emailSuccess,
+    },
+    req,
+  });
+
+  return res.status(200).json({
+    success: true,
+    emailMasked: emailService.maskEmail(admin.email),
+  });
+};
+
+/**
+ * Delete firm admin (non-system only)
+ * DELETE /api/superadmin/firms/:firmId/admins/:adminId
+ */
+const deleteFirmAdmin = async (req, res) => {
+  const { firmId, adminId } = req.params;
+  if (!mongoose.Types.ObjectId.isValid(firmId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Firm not found',
+    });
+  }
+  if (!mongoose.Types.ObjectId.isValid(adminId)) {
+    return res.status(404).json({
+      success: false,
+      message: 'Admin not found',
+    });
+  }
+
+  const firm = await Firm.findById(firmId).select('firmId name');
+  if (!firm) {
+    return res.status(404).json({
+      success: false,
+      code: 'FIRM_NOT_FOUND',
+      message: 'Firm not found',
+    });
+  }
+
+  const admin = await findFirmAdminById(firm._id, adminId);
+  if (!admin) {
+    return res.status(404).json({
+      success: false,
+      code: 'ADMIN_NOT_FOUND',
+      message: 'Admin not found',
+    });
+  }
+
+  if (admin.isSystem) {
+    return res.status(422).json({
+      success: false,
+      code: 'SYSTEM_ADMIN_DELETE_FORBIDDEN',
+      message: 'System admin cannot be deleted',
+    });
+  }
+
+  if (admin.status === 'deleted') {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_DELETED',
+      message: 'Admin is already deleted',
+    });
+  }
+
+  const session = getSession(req);
+  const adminForDeleteQuery = User.findOne({
+    _id: admin._id,
+    firmId: firm._id,
+    role: { $in: ADMIN_ROLE_VALUES },
+    status: { $ne: 'deleted' },
+  });
+  const adminForDelete = await resolveSessionQuery(adminForDeleteQuery, session);
+
+  if (!adminForDelete) {
+    const err = new Error('Admin not found');
+    err.statusCode = 404;
+    err.code = 'ADMIN_NOT_FOUND';
+    throw err;
+  }
+  if (adminForDelete.isSystem) {
+    const err = new Error('System admin cannot be deleted');
+    err.statusCode = 422;
+    err.code = 'SYSTEM_ADMIN_DELETE_FORBIDDEN';
+    throw err;
+  }
+  if (adminForDelete.status === 'deleted') {
+    const err = new Error('Admin is already deleted');
+    err.statusCode = 422;
+    err.code = 'ADMIN_DELETED';
+    throw err;
+  }
+
+  if (adminForDelete.status === 'active') {
+    const activeAdminsCountQuery = User.countDocuments({
+      firmId: firm._id,
+      role: { $in: ADMIN_ROLE_VALUES },
+      status: 'active',
+    });
+    const activeAdminsCount = await resolveSessionQuery(activeAdminsCountQuery, session);
+
+    if (activeAdminsCount <= 1) {
+      log.warn('[SUPERADMIN] Blocked delete: last active admin protection', {
+        firmId: firm.firmId,
+        adminXID: admin.xID,
+      });
+      const err = new Error('Cannot delete the last active admin for this firm');
+      err.statusCode = 422;
+      err.code = 'LAST_ACTIVE_ADMIN';
+      throw err;
+    }
+  }
+
+  adminForDelete.status = 'deleted';
+  adminForDelete.isActive = false;
+  adminForDelete.deletedAt = new Date();
+  await adminForDelete.save({ session });
+
+  // Re-read after commit to ensure audit metadata reflects persisted state, not mutable pre-transaction object references.
+  const deletedAdmin = await User.findById(adminId).select('xID email isSystem');
+
+  await logSuperadminAction({
+    actionType: 'AdminDeleted',
+    description: `Firm admin deleted for firm ${firm.name} (${firm.firmId}): ${deletedAdmin?.xID || admin.xID}`,
+    performedBy: req.user.email,
+    performedById: req.user._id,
+    targetEntityType: 'User',
+    targetEntityId: String(adminId),
+    metadata: {
+      firmId: firm.firmId,
+      firmName: firm.name,
+      adminXID: deletedAdmin?.xID || admin.xID,
+      adminEmail: deletedAdmin?.email || admin.email,
+      isSystem: Boolean(deletedAdmin?.isSystem),
+    },
+    req,
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: 'Admin deleted successfully',
+  });
+};
+
+/**
+ * Resend Admin Access (Invite or Password Reset)
+ * POST /api/superadmin/firms/:firmId/admin/resend-access
+ *
+ * Handles:
+ * - INVITED: Regenerates passwordSetupToken and sends setup email
+ * - ACTIVE: Regenerates passwordResetToken and sends reset email
+ * - DISABLED: Rejects request
+ *
+ * Invalidates old unused tokens before generating new ones.
+ * Always logs audit entry. Returns 200 even if email fails.
+ */
+const resendAdminAccess = async (req, res) => {
+  const { firmId } = req.params;
+
+  // Validate firm exists
+  const firm = await Firm.findById(firmId);
+  if (!firm) {
+    return res.status(404).json({
+      success: false,
+      code: 'FIRM_NOT_FOUND',
+      message: 'Firm not found',
+    });
+  }
+
+  // Find the default admin for this firm (isSystem=true, admin role variants supported)
+  const admin = await User.findOne({
+    firmId: firm._id,
+    isSystem: true,
+    role: { $in: ADMIN_ROLE_VALUES },
+    status: { $ne: 'deleted' },
+  });
+  if (!admin) {
+    return res.status(404).json({
+      success: false,
+      code: 'ADMIN_NOT_FOUND',
+      message: 'Default admin for this firm not found',
+    });
+  }
+
+  // Reject disabled admins
+  if (isAdminDisabledStatus(admin.status)) {
+    return res.status(422).json({
+      success: false,
+      code: 'ADMIN_DISABLED',
+      message: 'Admin account is disabled. Cannot resend access.',
+    });
+  }
+
+  const isInvited = admin.status === 'invited';
+  const tokenExpires = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+  const passwordSetupSecret = process.env.JWT_PASSWORD_SETUP_SECRET;
+  if (!passwordSetupSecret) {
+    return res.status(500).json({
+      success: false,
+      message: 'JWT_PASSWORD_SETUP_SECRET environment variable is not configured',
+    });
+  }
+
+  admin.passwordSetupTokenHash = null;
+  admin.passwordSetupExpires = null;
+  admin.passwordResetTokenHash = null;
+  admin.passwordResetExpires = null;
+
+  let newToken;
+  // Invalidate old tokens and set new ones
+  if (isInvited) {
+    newToken = jwt.sign(
+      {
+        userId: admin._id,
+        firmId: firm._id,
+        type: 'PASSWORD_SETUP',
+      },
+      passwordSetupSecret,
+      { expiresIn: PASSWORD_SETUP_TOKEN_EXPIRY }
+    );
+    admin.inviteSentAt = new Date();
+  } else {
+    // ACTIVE
+    newToken = crypto.randomBytes(32).toString('hex');
+    const newTokenHash = crypto.createHash('sha256').update(newToken).digest('hex');
+    admin.passwordResetTokenHash = newTokenHash;
+    admin.passwordResetExpires = tokenExpires;
+  }
+
+  await admin.save();
+
+  const maskedEmail = emailService.maskEmail(admin.email);
+  const action = isInvited ? 'INVITE_RESENT' : 'PASSWORD_RESET_SENT';
+
+  // Send email
+  let emailSuccess = true;
+  try {
+    let emailResult;
+    if (isInvited) {
+      emailResult = await emailService.sendPasswordSetupEmail({
+        email: admin.email,
+        name: admin.name,
+        token: newToken,
+        xID: admin.xID,
+        firmSlug: firm.firmSlug,
+        role: admin.role,
+        req,
+      });
+    } else {
+      emailResult = await emailService.sendAdminPasswordResetEmail({
+        email: admin.email,
+        name: admin.name,
+        token: newToken,
+        xID: admin.xID,
+        firmSlug: firm.firmSlug,
+        req,
+      });
+    }
+    if (emailResult && emailResult.success === false) {
+      emailSuccess = false;
+      log.warn('[SUPERADMIN] Admin access resend email not sent:', emailResult.error);
+    }
+  } catch (emailError) {
+    emailSuccess = false;
+    log.warn('[SUPERADMIN] Failed to send admin access resend email:', emailError.message);
+  }
+
+  // Log audit entry
+  await logSuperadminAction({
+    actionType: emailSuccess ? 'AdminAccessResent' : 'AdminAccessResendEmailFailed',
+    description: `Admin access resent (${action}) for firm ${firm.name} (${firm.firmId}), admin ${admin.xID}`,
+    performedBy: req.user.email,
+    performedById: req.user._id,
+    targetEntityType: 'User',
+    targetEntityId: admin._id.toString(),
+    metadata: {
+      firmId: firm.firmId,
+      firmName: firm.name,
+      adminXID: admin.xID,
+      action,
+      emailSuccess,
+    },
+    req,
+  });
+
+  return res.status(200).json({
+    success: true,
+    action,
+    emailMasked: maskedEmail,
+  });
+};
+
+/**
+ * Deactivate a firm (set status to INACTIVE)
+ * PATCH /api/superadmin/firms/:id/deactivate
+ */
+const deactivateFirm = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const firm = await Firm.findById(id);
+    if (!firm) {
+      return res.status(404).json({ success: false, message: 'Firm not found' });
+    }
+    if (firm.status !== 'active') {
+      return res.status(400).json({ success: false, message: 'Firm must be ACTIVE to deactivate' });
+    }
+    firm.status = 'suspended';
+    await firm.save();
+    await logSuperadminAction({
+      actionType: 'FirmDeactivated',
+      description: `Firm deactivated: ${firm.name} (${firm.firmId})`,
+      performedBy: req.user.email,
+      performedById: req.user._id,
+      targetEntityType: 'Firm',
+      targetEntityId: firm._id.toString(),
+      metadata: { firmId: firm.firmId, name: firm.name, oldStatus: 'active', newStatus: 'suspended' },
+      req,
+    });
+    return res.json({ success: true, data: { _id: firm._id, firmId: firm.firmId, name: firm.name, status: firm.status } });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error deactivating firm:', error);
+    return res.status(500).json({ success: false, message: 'Failed to deactivate firm' });
+  }
+};
+
+/**
+ * Activate a firm (set status to ACTIVE)
+ * PATCH /api/superadmin/firms/:id/activate
+ */
+const activateFirm = async (req, res, next) => {
+  let session;
+  try {
+    session = await mongoose.startSession();
+    let activatedFirm = null;
+    let activationAudit = null;
+    const { id } = req.params;
+    await session.withTransaction(async () => {
+      const firm = await Firm.findById(id).session(session);
+      if (!firm) {
+        const error = new Error('Firm not found');
+        error.statusCode = 404;
+        throw error;
+      }
+      if (!['suspended', 'INACTIVE'].includes(firm.status)) {
+        const error = new Error('Firm must be INACTIVE (suspended) to activate');
+        error.statusCode = 400;
+        throw error;
+      }
+
+      const oldStatus = firm.status;
+      firm.status = 'active';
+      await firm.save({ session });
+
+      activationAudit = {
+        eventType: 'AdminMutation',
+        xID: req.user?.xID || 'UNKNOWN_ACTOR',
+        firmId: firm.firmId || 'UNKNOWN_FIRM',
+        userId: req.user?._id,
+        description: `PATCH ${req.originalUrl || req.url || `/api/superadmin/firms/${id}/activate`}`,
+        performedBy: req.user?.xID || req.user?.email || 'UNKNOWN',
+        metadata: {
+          target: firm._id.toString(),
+          scope: 'GLOBAL',
+          requestId: req.requestId,
+          oldStatus,
+          newStatus: 'active',
+        },
+      };
+
+      activatedFirm = { _id: firm._id, firmId: firm.firmId, name: firm.name, status: firm.status };
+    });
+    await safeAuditLog(activationAudit, req);
+    await logSuperadminAction({
+      actionType: 'FirmActivated',
+      description: `Firm activated: ${activatedFirm.name} (${activatedFirm.firmId})`,
+      performedBy: req.user.email,
+      performedById: req.user._id,
+      targetEntityType: 'Firm',
+      targetEntityId: activatedFirm._id.toString(),
+      metadata: { firmId: activatedFirm.firmId, name: activatedFirm.name, newStatus: 'active' },
+      req,
+    });
+    return res.status(200).json({
+      success: true,
+      message: 'Firm activated successfully',
+      data: activatedFirm,
+    });
+  } catch (error) {
+    return next(error);
+  } finally {
+    if (session) {
+      await session.endSession();
+    }
+  }
+};
+
+const PLAN_VALUES = ['pilot', 'starter', 'professional', 'enterprise'];
+
+const buildPlanCapacityMetadata = (firm, userCount = 0) => {
+  const maxUsers = Number.isFinite(Number(firm?.maxUsers)) ? Number(firm.maxUsers) : 0;
+  const safeUserCount = Number.isFinite(Number(userCount)) ? Number(userCount) : 0;
+  const capacityUsedPercent = maxUsers > 0 ? Math.min(999, Math.round((safeUserCount / maxUsers) * 100)) : 0;
+  const capacityStatus = safeUserCount > maxUsers ? 'over_capacity' : (capacityUsedPercent >= 85 ? 'near_capacity' : 'within_capacity');
+  return {
+    firmObjectId: firm?._id, firmId: firm?.firmId, firmSlug: firm?.firmSlug, name: firm?.name, status: firm?.status,
+    plan: String(firm?.plan || 'pilot').toLowerCase(), maxUsers, userCount: safeUserCount, capacityUsedPercent, capacityStatus,
+    subscriptionStatus: firm?.subscriptionStatus || null, billingStatus: firm?.billingStatus || null,
+    href: `/app/superadmin/firms/${firm?._id}`,
+  };
+};
+
+const getPilotReadiness = async (req, res) => {
+  try {
+    const snapshot = await buildPilotReadinessSnapshot();
+    return res.json({ success: true, data: snapshot });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading pilot readiness snapshot:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load pilot readiness snapshot' });
+  }
+};
+
+const getPlansCapacity = async (req, res) => {
+  try {
+    const firms = await Firm.find().select('firmId firmSlug name status plan maxUsers subscriptionStatus billingStatus').sort({ createdAt: -1 }).lean();
+    const firmIds = firms.map((f) => f._id);
+    const userCounts = await User.aggregate([{ $match: { firmId: { $in: firmIds }, status: { $ne: 'deleted' } } }, { $group: { _id: '$firmId', count: { $sum: 1 } } }]);
+    const userCountMap = new Map(userCounts.map((entry) => [String(entry._id), Number(entry.count) || 0]));
+    const rows = firms.map((firm) => buildPlanCapacityMetadata(firm, userCountMap.get(String(firm._id)) || 0));
+    const totals = rows.reduce((acc, row) => {
+      acc.firms += 1;
+      if (PLAN_VALUES.includes(row.plan)) acc[row.plan] += 1;
+      if (row.capacityStatus === 'over_capacity') acc.overCapacity += 1;
+      if (row.capacityStatus === 'near_capacity') acc.nearCapacity += 1;
+      return acc;
+    }, { firms: 0, pilot: 0, starter: 0, professional: 0, enterprise: 0, overCapacity: 0, nearCapacity: 0 });
+
+    return res.json({ success: true, data: { totals, firms: rows } });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error loading plan/capacity snapshot:', error);
+    return res.status(500).json({ success: false, message: 'Failed to load plans and capacity snapshot' });
+  }
+};
+
+const updateFirmPlanCapacity = async (req, res) => {
+  try {
+    const { firmId } = req.params;
+    const updates = {};
+    if (Object.prototype.hasOwnProperty.call(req.body, 'plan')) updates.plan = String(req.body.plan || '').toLowerCase();
+    if (Object.prototype.hasOwnProperty.call(req.body, 'maxUsers')) updates.maxUsers = Number(req.body.maxUsers);
+    if (Object.prototype.hasOwnProperty.call(req.body, 'subscriptionStatus')) updates.subscriptionStatus = req.body.subscriptionStatus || null;
+    if (Object.prototype.hasOwnProperty.call(req.body, 'billingStatus')) updates.billingStatus = req.body.billingStatus || null;
+
+    if (updates.plan && !PLAN_VALUES.includes(updates.plan)) {
+      return res.status(400).json({ success: false, message: 'Invalid plan. Allowed: pilot, starter, professional, enterprise.' });
+    }
+
+    const firm = await Firm.findById(firmId);
+    if (!firm) return res.status(404).json({ success: false, message: 'Firm not found' });
+
+    const counts = await User.aggregate([{ $match: { firmId: firm._id, status: { $ne: 'deleted' } } }, { $group: { _id: '$firmId', count: { $sum: 1 } } }]);
+    const activeUserCount = counts[0]?.count || 0;
+    if (Number.isFinite(updates.maxUsers) && updates.maxUsers < activeUserCount) {
+      return res.status(400).json({ success: false, message: `maxUsers cannot be lower than current active user count (${activeUserCount}).` });
+    }
+
+    const before = buildPlanCapacityMetadata(firm.toObject(), activeUserCount);
+    let changed = false;
+    for (const [k,v] of Object.entries(updates)) { if (firm[k] !== v) { firm[k]=v; changed = true; } }
+    if (changed) await firm.save();
+    const after = buildPlanCapacityMetadata(firm.toObject(), activeUserCount);
+
+    if (changed) {
+      await logSuperadminAction({ actionType: 'FirmPlanCapacityUpdated', description: `Updated plan/capacity for ${firm.name} (${firm.firmId})`, performedBy: req.user.email, performedById: req.user._id, targetEntityType: 'Firm', targetEntityId: firm._id.toString(), metadata: { firmId: firm.firmId, before, after }, req });
+    }
+
+    return res.json({ success: true, data: after });
+  } catch (error) {
+    log.error('[SUPERADMIN] Error updating firm plan/capacity:', error);
+    return res.status(500).json({ success: false, message: 'Failed to update firm plan/capacity' });
+  }
+};
+
+module.exports = {
+  createFirm: wrapWriteHandler(createFirm),
+  listFirms,
+  updateFirmStatus: wrapWriteHandler(updateFirmStatus),
+  disableFirmImmediately: wrapWriteHandler(disableFirmImmediately),
+  createFirmAdmin: wrapWriteHandler(createFirmAdmin),
+  listFirmAdmins,
+  getFirmAdminDetails,
+  deleteFirmAdmin: wrapWriteHandler(deleteFirmAdmin),
+  updateFirmAdminStatus: wrapWriteHandler(updateFirmAdminStatus),
+  forceResetFirmAdmin: wrapWriteHandler(forceResetFirmAdmin),
+  resendAdminAccess: wrapWriteHandler(resendAdminAccess),
+  getPlatformStats,
+  getOnboardingInsights,
+  getOnboardingInsightDetails,
+  getOnboardingAlerts,
+  getSupportDiagnostics,
+  getFirmHealth,
+  getPilotReadiness,
+  getPlansCapacity,
+  getSuperadminFeatureFlags,
+  updateSuperadminFeatureFlag: wrapWriteHandler(updateSuperadminFeatureFlag),
+  updateFirmPlanCapacity,
+  getSuperadminAuditLogs,
+  getSuperadminGlobalSearch,
+  getFirmBySlug,
+  getOperationalHealth,
+  switchFirm,
+  exitFirm,
+  // Intentionally not wrapped: activateFirm owns its explicit session.withTransaction lifecycle.
+  activateFirm,
+  deactivateFirm: wrapWriteHandler(deactivateFirm),
+};
